@@ -1590,19 +1590,33 @@ Ensure each slide has:
                 }
             )
             
-            if not response.text:
+            # --- handle multi-part responses ---
+            texts = []
+            for cand in getattr(response, "candidates", []) or []:
+                content = getattr(cand, "content", None)
+                parts = getattr(content, "parts", None) or []
+                for part in parts:
+                    t = getattr(part, "text", None) or (part.get("text") if isinstance(part, dict) else None)
+                    if t:
+                        texts.append(t)
+    
+            if not texts and hasattr(response, "text") and response.text:
+                # fallback for simple responses
+                texts.append(response.text)
+    
+            text = "\n".join(texts).strip()
+            if not text:
                 raise ValueError("Empty response from Google Gemini")
-                
-            return response.text.strip()
-            
-        except Exception as e:
-            error_msg = str(e).lower()
-            if 'api key' in error_msg or 'authentication' in error_msg:
-                raise ValueError("Invalid Google API key")
-            elif 'quota' in error_msg or 'limit' in error_msg:
-                raise ValueError("Google API quota exceeded. Please try again later.")
-            else:
-                raise ValueError(f"Google API error: {str(e)}")
+            return text
+
+    except Exception as e:
+        msg = str(e).lower()
+        if 'api key' in msg or 'authentication' in msg:
+            raise ValueError("Invalid Google API key")
+        elif 'quota' in msg or 'limit' in msg:
+            raise ValueError("Google API quota exceeded. Please try again later.")
+        else:
+            raise ValueError(f"Google API error: {str(e)}")
     
     def _extract_slides_from_response(self, response: str) -> List[Dict]:
         """Extract and validate slide data from LLM response"""
