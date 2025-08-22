@@ -1433,8 +1433,8 @@ class PPTGenerator:
     
     def __init__(self):
         self.supported_providers = ['openai', 'anthropic', 'google']
-        self.max_slides = 15
-        self.min_slides = 3
+        self.max_slides = 20
+        self.min_slides = 1
     
     def parse_text_to_slides(self, text: str, provider: str, api_key: str, guidance: str = "") -> List[Dict]:
         """Parse text into structured slide content using LLM"""
@@ -1580,7 +1580,7 @@ Ensure each slide has:
         """Call Google Gemini API with error handling"""
         try:
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel('gemini-pro')
+            model = genai.GenerativeModel('gemini-2.5-pro')
             
             response = model.generate_content(
                 prompt,
