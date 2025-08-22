@@ -1825,7 +1825,7 @@ ppt_generator = PPTGenerator()
 def index():
     """Serve the main application"""
     try:
-        return render_template('index.html')
+        return render_template_string(HTML_TEMPLATE)
     except Exception as e:
         logger.error(f"Error serving template: {e}")
         # Fallback if template file is missing
