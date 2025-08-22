@@ -1,0 +1,11 @@
+Flask==2.3.3
+Flask-CORS==4.0.0
+openai==0.28.1
+anthropic==0.7.8
+google-generativeai==0.3.2
+python-pptx==0.6.22
+markdown==3.5.1
+gunicorn==21.2.0
+python-dotenv==1.0.0
+requests==2.31.0
+Pillow==10.1.0
