@@ -724,7 +724,7 @@ Tip: Use headers (# ## ###) to structure your content - they'll become slide tit
                             <input type="radio" name="provider" value="google">
                             <span class="provider-logo">✨</span>
                             <div class="provider-name">Google</div>
-                            <div class="provider-model">Gemini Pro</div>
+                            <div class="provider-model">Gemini 2.5 Pro</div>
                         </label>
                     </div>
                     <div class="input-group">
@@ -1575,76 +1575,72 @@ Ensure each slide has:
             raise ValueError("Failed to connect to Anthropic. Please check your internet connection.")
         except Exception as e:
             raise ValueError(f"Anthropic API error: {str(e)}")
-    
+     
+    # --- Gemini call: robust multi-part handling ---
     def _call_google(self, prompt: str, api_key: str) -> str:
-        """Call Google Gemini API with error handling"""
+        import google.generativeai as genai
         try:
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel('gemini-2.5-pro')
-            
+            model = genai.GenerativeModel("gemini-2.5-pro")
             response = model.generate_content(
                 prompt,
-                generation_config={
-                    'temperature': 0.7,
-                    'max_output_tokens': 2000,
-                }
+                generation_config={"temperature": 0.7, "max_output_tokens": 2000},
             )
-            
-            # --- handle multi-part responses ---
+    
+            # Prefer parts from candidates
             texts = []
             for cand in getattr(response, "candidates", []) or []:
                 content = getattr(cand, "content", None)
-                parts = getattr(content, "parts", None) or []
-                for part in parts:
-                    t = getattr(part, "text", None) or (part.get("text") if isinstance(part, dict) else None)
-                    if t:
-                        texts.append(t)
+                if content and getattr(content, "parts", None):
+                    for part in content.parts:
+                        t = getattr(part, "text", None)
+                        if t:
+                            texts.append(t)
     
+            # Fallback to response.text when simple
             if not texts and hasattr(response, "text") and response.text:
-                # fallback for simple responses
                 texts.append(response.text)
     
             text = "\n".join(texts).strip()
             if not text:
                 raise ValueError("Empty response from Google Gemini")
             return text
-
-    except Exception as e:
-        msg = str(e).lower()
-        if 'api key' in msg or 'authentication' in msg:
-            raise ValueError("Invalid Google API key")
-        elif 'quota' in msg or 'limit' in msg:
-            raise ValueError("Google API quota exceeded. Please try again later.")
-        else:
+    
+        except Exception as e:
+            msg = str(e).lower()
+            if "api key" in msg or "authentication" in msg:
+                raise ValueError("Invalid Google API key")
+            if "quota" in msg or "limit" in msg:
+                raise ValueError("Google API quota exceeded. Please try again later.")
             raise ValueError(f"Google API error: {str(e)}")
     
+    
+    # --- Extract slides: ensure try/except is complete and aligned ---
     def _extract_slides_from_response(self, response: str) -> List[Dict]:
         """Extract and validate slide data from LLM response"""
         try:
             # Clean the response
-            response = response.strip()
-            
-            # Remove code block markers if present
-            if response.startswith('```json'):
+            response = (response or "").strip()
+    
+            # Strip code fences (``` or ```json)
+            if response.startswith("```json"):
                 response = response[7:]
-            if response.startswith('```'):
+            if response.startswith("```"):
                 response = response[3:]
-            if response.endswith('```'):
+            if response.endswith("```"):
                 response = response[:-3]
-            
-            # Try to find JSON in the response
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+    
+            # Try to find a JSON object within the text
+            json_match = re.search(r"\{.*\}", response, re.DOTALL)
             if json_match:
-                json_str = json_match.group()
-                data = json.loads(json_str)
-                
-                if 'slides' in data and isinstance(data['slides'], list):
-                    return data['slides']
-            
-            # If JSON parsing fails, try fallback parsing
+                data = json.loads(json_match.group())
+                if isinstance(data, dict) and isinstance(data.get("slides"), list):
+                    return data["slides"]
+    
+            # If JSON parsing fails, try the fallback
             logger.warning("JSON parsing failed, using fallback method")
             return self._fallback_parse(response)
-            
+    
         except json.JSONDecodeError as e:
             logger.warning(f"JSON decode error: {e}, using fallback method")
             return self._fallback_parse(response)
