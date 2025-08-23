@@ -61,9 +61,9 @@ class RateLimiter:
     def __init__(self):
         self.last_call_at: Dict[str, float] = {}
         self.rpm = {
-            "google": int(os.environ.get("GEMINI_RPM", "20")),  # CHANGED to 10
+            "google": int(os.environ.get("GEMINI_RPM", "30")),  # CHANGED to 10
             "openai": int(os.environ.get("OPENAI_RPM", "30")),
-            "anthropic": int(os.environ.get("ANTHROPIC_RPM", "20")),
+            "anthropic": int(os.environ.get("ANTHROPIC_RPM", "30")),
         }
 
     def before_call(self, provider: str, retry_after: Optional[int] = None):
