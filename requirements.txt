@@ -1,14 +1,20 @@
+# --- Runtime ---
 Flask==3.1.2
-Flask-CORS==6.0.1
+Flask-Cors==6.0.1
+gunicorn==23.0.0
+
+# --- LLM SDKs (latest) ---
 openai==1.101.0
 anthropic==0.64.0
 google-generativeai==0.8.5
+httpx==0.28.1
 
-markdown==3.8.2
-gunicorn==23.0.0
-python-dotenv==1.1.1
-requests==2.32.5
-
+# --- PPT generation ---
 Pillow>=11.3.0,<12
 python-pptx>=1.0.2
-lxml>=5.2.1     
+lxml==6.0.1
+
+# --- Typing / build tools ---
+typing_extensions==4.14.1
+setuptools==80.9.0
+pip==25.2
