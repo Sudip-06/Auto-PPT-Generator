@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Auto PPT Generator - Robust LLM parsing, enhanced prompting, improved content processing,
-and safer slide creation with template reuse. (Keeps index.html unchanged)
+and safer slide creation with template reuse (styles + images). Keeps index.html unchanged.
 """
 
 import os
@@ -9,13 +9,14 @@ import re
 import json
 import tempfile
 import logging
+from io import BytesIO
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
 from flask import Flask, request, jsonify, send_file, render_template
 from flask_cors import CORS
 
-# --- LLM SDKs (ensure they're installed in requirements) ---
+# --- LLM SDKs ---
 import openai
 import anthropic
 import google.generativeai as genai
@@ -24,6 +25,7 @@ import google.generativeai as genai
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 # ------------------------------------------------------------------------------
 # Logging & App
@@ -46,6 +48,7 @@ class PPTGenerator:
         self.supported_providers = ["openai", "anthropic", "google"]
         self.max_slides = 12
         self.min_slides = 3
+        self._style_ctx: Optional[dict] = None
 
     # ------------------------------ Public API ------------------------------
 
@@ -53,10 +56,8 @@ class PPTGenerator:
         self, text: str, provider: str, api_key: str, guidance: str = ""
     ) -> List[Dict]:
         """Parse raw text into normalized slide dicts using an LLM with robust fallbacks."""
-        # Estimate slide count from length
         word_count = len((text or "").split())
         estimated_slides = max(self.min_slides, min(self.max_slides, word_count // 120 + 1))
-
         prompt = self._create_enhanced_prompt(text, guidance, estimated_slides)
 
         try:
@@ -64,36 +65,71 @@ class PPTGenerator:
             response = self._call_llm_with_retry(provider, api_key, prompt)
             slides = self._robust_json_extraction(response)
             slides = self._validate_and_enhance_slides(slides)
+            # ensure a conclusion slide exists at the end
+            if not slides or slides[-1].get("slide_type") != "conclusion_slide":
+                slides.append(
+                    {
+                        "title": "Conclusion & Next Steps",
+                        "content": ["Summary of key points", "Actionable next steps", "Q&A"],
+                        "slide_type": "conclusion_slide",
+                        "speaker_notes": "Wrap up",
+                    }
+                )
             logger.info(f"Generated {len(slides)} slides successfully")
-            return slides
+            return slides[: self.max_slides]
         except Exception as e:
             logger.error(f"Error parsing text: {e}")
             logger.warning("Using emergency fallback parsing")
-            return self._emergency_fallback_parsing(text)
+            slides = self._emergency_fallback_parsing(text)
+            return slides[: self.max_slides]
 
     def create_presentation(self, slides_data: List[Dict], template_file: Optional[str] = None) -> Presentation:
         """Create a PPTX from normalized slide data, safely reusing optional template."""
         try:
             if template_file:
                 prs = Presentation(template_file)
-                # Reuse theme/layouts; drop any existing slides to prevent duplicates
+                style = self._extract_style_and_assets(prs)
                 if len(prs.slides) > 0:
                     self._safely_clear_slides(prs)
                 logger.info("Using uploaded template")
             else:
                 prs = Presentation()
+                style = {
+                    "title_font": None, "body_font": None,
+                    "title_color": RGBColor(31, 73, 125), "body_color": RGBColor(64, 64, 64),
+                    "images": []
+                }
                 logger.info("Using default template")
         except Exception as e:
             logger.warning(f"Template error: {e}, using default")
             prs = Presentation()
+            style = {
+                "title_font": None, "body_font": None,
+                "title_color": RGBColor(31, 73, 125), "body_color": RGBColor(64, 64, 64),
+                "images": []
+            }
 
+        # keep style context for helpers
+        self._style_ctx = style
         for i, slide_data in enumerate(slides_data):
             try:
                 self._create_enhanced_slide(prs, slide_data, i)
+                # opportunistic image reuse from template assets
+                if self._style_ctx["images"]:
+                    img_path = self._style_ctx["images"][i % len(self._style_ctx["images"])]
+                    try:
+                        slide = prs.slides[-1]
+                        if slide_data.get("slide_type") == "title_slide":
+                            slide.shapes.add_picture(img_path, Inches(9.0), Inches(0.3), height=Inches(0.8))
+                        else:
+                            slide.shapes.add_picture(img_path, Inches(9.2), Inches(5.2), height=Inches(1.0))
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.error(f"Error creating slide {i}: {e}")
                 self._create_fallback_slide(prs, slide_data, i)
-
+        # cleanup: not deleting image temp files here to avoid races on concurrent requests
+        self._style_ctx = None
         return prs
 
     # ------------------------------ Prompting ------------------------------
@@ -107,11 +143,10 @@ Rules:
 - JSON must follow the exact schema shown below.
 - Style: {style_guidance}
 - 1 title slide, 1+ content slides, and a conclusion slide.
-- Each slide has 3-5 bullet points, each < 15 words.
-- Language must be concise and action oriented.
+- Each slide has 3–5 bullet points, each < 15 words, action oriented.
 - Target slides: {target_slides} (±2 permitted).
 
-JSON SCHEMA (example keys, real content must replace placeholders):
+JSON SCHEMA (example keys, replace placeholders with real content):
 {{
   "presentation_title": "Clear, Compelling Title",
   "slides": [
@@ -136,7 +171,7 @@ JSON SCHEMA (example keys, real content must replace placeholders):
   ]
 }}
 
-CONTENT (truncate on your own as needed to obey limits):
+CONTENT:
 {text[:8000]}
 """
 
@@ -202,9 +237,8 @@ CONTENT (truncate on your own as needed to obey limits):
                 if getattr(block, "type", "") == "text" and getattr(block, "text", ""):
                     parts.append(block.text)
             text = ("\n".join(parts)).strip() if parts else ""
-            if not text:
-                # Fallback: sometimes content is present but not typed 'text'
-                text = (resp.content[0].text.strip() if resp.content and getattr(resp.content[0], "text", None) else "")
+            if not text and resp.content and getattr(resp.content[0], "text", None):
+                text = resp.content[0].text.strip()
             if not text:
                 raise ValueError("Empty response from Claude")
             return text
@@ -216,18 +250,47 @@ CONTENT (truncate on your own as needed to obey limits):
             raise ValueError(f"Anthropic error: {str(e)}")
 
     def _call_google_enhanced(self, prompt: str, api_key: str) -> str:
-        """Gemini 2.5 Pro with full parts aggregation (no response.text quick accessor)."""
+        """Gemini 2.5 Pro with JSON schema & parts aggregation (no response.text quick accessor)."""
         try:
             genai.configure(api_key=api_key)
+
+            # JSON-mode schema to reduce refusals/empty candidates
+            schema = genai.types.Schema(
+                type=genai.types.Type.OBJECT,
+                properties={
+                    "presentation_title": genai.types.Schema(type=genai.types.Type.STRING),
+                    "slides": genai.types.Schema(
+                        type=genai.types.Type.ARRAY,
+                        items=genai.types.Schema(
+                            type=genai.types.Type.OBJECT,
+                            properties={
+                                "title": genai.types.Schema(type=genai.types.Type.STRING),
+                                "content": genai.types.Schema(
+                                    type=genai.types.Type.ARRAY, items=genai.types.Schema(type=genai.types.Type.STRING)
+                                ),
+                                "slide_type": genai.types.Schema(type=genai.types.Type.STRING),
+                                "speaker_notes": genai.types.Schema(type=genai.types.Type.STRING),
+                            },
+                            required=["title", "content", "slide_type"],
+                        ),
+                    ),
+                },
+                required=["slides"],
+            )
+
             model = genai.GenerativeModel("gemini-2.5-pro")
             resp = model.generate_content(
                 prompt,
                 generation_config=genai.types.GenerationConfig(
-                    temperature=0.2, max_output_tokens=1800, candidate_count=1
+                    temperature=0.2,
+                    max_output_tokens=1800,
+                    candidate_count=1,
+                    response_mime_type="application/json",
+                    response_schema=schema,
                 ),
             )
 
-            # Aggregate from candidates[].content.parts[]
+            # Aggregate JSON from parts
             texts: List[str] = []
             for cand in getattr(resp, "candidates", []) or []:
                 content = getattr(cand, "content", None)
@@ -236,7 +299,6 @@ CONTENT (truncate on your own as needed to obey limits):
                     if t:
                         texts.append(t)
 
-            # Fallback to resp.text if SDK provided it as simple text
             if not texts and getattr(resp, "text", None):
                 texts.append(resp.text)
 
@@ -326,6 +388,7 @@ CONTENT (truncate on your own as needed to obey limits):
                 {"title": title, "content": content, "slide_type": stype, "speaker_notes": notes}
             )
 
+        # enforce max slides
         return out[: self.max_slides]
 
     def _md_to_slides(self, text: str) -> List[Dict]:
@@ -411,7 +474,7 @@ CONTENT (truncate on your own as needed to obey limits):
     def _create_default_slides(self, original_text: str) -> List[Dict]:
         words = (original_text or "").split()
         chunk_size = max(50, len(words) // 4 or 50)
-        chunks = [" ".join(words[i : i + chunk_size]) for i in range(0, len(words), chunk_size)]
+        chunks = [" ".join(words[i: i + chunk_size]) for i in range(0, len(words), chunk_size)]
         slides = [
             {
                 "title": "Presentation Overview",
@@ -475,6 +538,62 @@ CONTENT (truncate on your own as needed to obey limits):
             }
         )
         return slides
+
+    # ------------------------------ Template Style/Assets ------------------------------
+
+    def _extract_style_and_assets(self, prs: Presentation) -> dict:
+        """
+        Heuristically extract title/body font names, primary colors, and picture assets
+        from the uploaded PPTX/POTX before slides are cleared.
+        """
+        style = {
+            "title_font": None,
+            "body_font": None,
+            "title_color": RGBColor(31, 73, 125),  # default pro blue
+            "body_color": RGBColor(64, 64, 64),
+            "images": [],  # list of temp file paths
+        }
+
+        # Try reading first slide placeholders for font/color
+        try:
+            if len(prs.slides):
+                s0 = prs.slides[0]
+                if getattr(s0.shapes, "title", None) and s0.shapes.title.has_text_frame:
+                    p = s0.shapes.title.text_frame.paragraphs[0].font
+                    if getattr(p, "name", None):
+                        style["title_font"] = p.name
+                    if getattr(p.color, "rgb", None):
+                        style["title_color"] = p.color.rgb
+                # find any text placeholder for body font
+                for shp in s0.placeholders:
+                    if hasattr(shp, "text_frame") and shp is not getattr(s0.shapes, "title", None):
+                        pf = shp.text_frame.paragraphs[0].font
+                        if getattr(pf, "name", None):
+                            style["body_font"] = style["body_font"] or pf.name
+                        if getattr(pf.color, "rgb", None):
+                            style["body_color"] = pf.color.rgb
+                        break
+        except Exception:
+            pass
+
+        # Harvest picture assets (from all slides)
+        try:
+            for s in prs.slides:
+                for shp in s.shapes:
+                    if shp.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                        try:
+                            blob = shp.image.blob
+                            ext = shp.image.ext or "png"
+                            tf = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}")
+                            tf.write(blob)
+                            tf.flush(); tf.close()
+                            style["images"].append(tf.name)
+                        except Exception:
+                            continue
+        except Exception:
+            pass
+
+        return style
 
     # ------------------------------ PPT Creation Helpers ------------------------------
 
@@ -542,6 +661,10 @@ CONTENT (truncate on your own as needed to obey limits):
                         try:
                             p.font.size = Pt(20)
                             p.space_after = Pt(8)
+                            ctx = getattr(self, "_style_ctx", None) or {}
+                            if ctx.get("body_font"):
+                                p.font.name = ctx["body_font"]
+                            p.font.color.rgb = ctx.get("body_color", RGBColor(64, 64, 64))
                         except Exception:
                             pass
                 else:
@@ -560,11 +683,13 @@ CONTENT (truncate on your own as needed to obey limits):
                 font = paragraph.font
                 font.size = Pt(36 if is_main_title else 30)
                 font.bold = True
-                if is_main_title:
-                    try:
-                        font.color.rgb = RGBColor(31, 73, 125)
-                    except Exception:
-                        pass
+                ctx = getattr(self, "_style_ctx", None) or {}
+                if ctx.get("title_font"):
+                    font.name = ctx["title_font"]
+                try:
+                    font.color.rgb = ctx.get("title_color", RGBColor(31, 73, 125))
+                except Exception:
+                    pass
         except Exception as e:
             logger.debug(f"Title styling failed: {e}")
 
@@ -578,6 +703,10 @@ CONTENT (truncate on your own as needed to obey limits):
                 p.text = f"• {bullet_text}"
                 try:
                     p.font.size = Pt(18)
+                    ctx = getattr(self, "_style_ctx", None) or {}
+                    if ctx.get("body_font"):
+                        p.font.name = ctx["body_font"]
+                    p.font.color.rgb = ctx.get("body_color", RGBColor(64, 64, 64))
                 except Exception:
                     pass
         except Exception as e:
@@ -613,6 +742,10 @@ CONTENT (truncate on your own as needed to obey limits):
                     p.text = f"• {item}"
                     try:
                         p.font.size = Pt(18)
+                        ctx = getattr(self, "_style_ctx", None) or {}
+                        if ctx.get("body_font"):
+                            p.font.name = ctx["body_font"]
+                        p.font.color.rgb = ctx.get("body_color", RGBColor(64, 64, 64))
                     except Exception:
                         pass
         except Exception as e:
@@ -673,14 +806,16 @@ def generate_presentation():
 
             presentation = ppt_generator.create_presentation(slides_data, template_path)
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as out:
-                presentation.save(out.name)
-                return send_file(
-                    out.name,
-                    as_attachment=True,
-                    download_name=f'presentation_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pptx',
-                    mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                )
+            # In-memory output to avoid 200/0 length edge cases
+            bio = BytesIO()
+            presentation.save(bio)
+            bio.seek(0)
+            return send_file(
+                bio,
+                as_attachment=True,
+                download_name=f'presentation_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pptx',
+                mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            )
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
         except Exception as e:
