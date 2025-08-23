@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
-Auto PPT Generator – Read-first pipeline:
-1) LOCAL ANALYSIS: parse input into title/sections/key bullets (no LLM).
-2) LLM GENERATION: prompt uses that analysis; JSON-only.
-3) QUALITY: refinement pass; or sectional generation fallback if needed.
+Auto PPT Generator — Rate-limit aware, multi-provider fallback, and local MaxiSynth
+to maximize slide quality/quantity even under hard quota.
 
-Also:
-- Preserves uploaded template slides; appends generated slides.
-- Reuses fonts/colors/images from template.
-- Safe text bounds, autosize, pagination, long-bullet splitting.
-- Gemini 2.5 Pro JSON mode (no Schema hard-dep), max_output_tokens=4000.
-- Works with OpenAI (gpt-5), Anthropic (claude-opus-4-1), Google (gemini-2.5-pro).
+Key features:
+- Provider fallback chain (user provider -> others via env keys)
+- Gemini 2.5 Pro JSON mime mode, max_output_tokens=4000 (no response.text)
+- Per-provider rate limiter (Gemini free RPM=2), backoff with jitter, no thrash
+- "Read-first" local analysis + MaxiSynth (Overview, Sections, Facts, Metrics,
+  Timeline, FAQs, Risks/Mitigations, Next Steps) -> dense slides when LLMs fail
+- Keeps uploaded template *slides*, appends generated slides; reuses fonts/colors/images
+- Safe margins, autosize, adaptive font, pagination, long-bullet splitting
 """
 
 import os
 import re
 import json
+import time
+import random
 import tempfile
 import logging
 from io import BytesIO
@@ -49,6 +51,49 @@ app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB uploads
 
 
 # ------------------------------------------------------------------------------
+# Simple in-memory rate limiter (best-effort per-process)
+# ------------------------------------------------------------------------------
+class RateLimiter:
+    """
+    Token bucket-ish limiter per provider.
+    - For Gemini free: allow ~2 req/min to avoid 429 spam.
+    - Adds jitter and respects server 'retry_delay' when detected in error text.
+    """
+
+    def __init__(self):
+        self.last_call_at: Dict[str, float] = {}
+        # requests per minute (RPM)
+        self.rpm = {
+            "google": int(os.environ.get("GEMINI_RPM", "2")),
+            "openai": int(os.environ.get("OPENAI_RPM", "30")),
+            "anthropic": int(os.environ.get("ANTHROPIC_RPM", "10")),
+        }
+
+    def before_call(self, provider: str, retry_after: Optional[int] = None):
+        now = time.time()
+        rpm = self.rpm.get(provider, 10)
+        min_gap = 60.0 / max(rpm, 1)
+        last = self.last_call_at.get(provider, 0)
+
+        # If server suggested retry_after, prefer it
+        if retry_after and retry_after > 0:
+            sleep_for = retry_after + random.uniform(0.2, 0.8)
+            logger.info(f"[RL] Sleeping {sleep_for:.1f}s due to server retry_after for {provider}")
+            time.sleep(sleep_for)
+        else:
+            # enforce min gap with small jitter
+            gap = (last + min_gap) - now
+            if gap > 0:
+                sleep_for = gap + random.uniform(0.05, 0.25)
+                logger.info(f"[RL] Throttling {provider} for {sleep_for:.2f}s to respect RPM={rpm}")
+                time.sleep(sleep_for)
+        self.last_call_at[provider] = time.time()
+
+
+rl = RateLimiter()
+
+
+# ------------------------------------------------------------------------------
 # PPT Generator
 # ------------------------------------------------------------------------------
 class PPTGenerator:
@@ -57,7 +102,7 @@ class PPTGenerator:
         self.max_slides = 12
         self.min_slides = 3
         self._style_ctx: Optional[dict] = None
-        self.section_call_cap = 6  # sectional LLM calls cap
+        self.section_call_cap = 5  # sectional LLM calls cap (reduced for RPM safety)
 
     # ========================== PUBLIC ENTRYPOINTS ==========================
 
@@ -65,51 +110,58 @@ class PPTGenerator:
         self, text: str, provider: str, api_key: str, guidance: str = ""
     ) -> List[Dict]:
         """
-        Read-first pipeline:
-        - Local deterministic ANALYSIS of the input text.
-        - LLM asked to generate slides strictly from that analysis.
-        - If poor/empty, try a sectional generation fallback (small prompts).
-        - Validate, enhance, refine once.
+        Read-first pipeline with provider fallback and quota-aware behavior.
         """
         text = (text or "").strip()
         word_count = len(text.split())
         estimated = max(self.min_slides, min(self.max_slides, word_count // 120 + 1))
 
-        # 1) Local analysis (no LLM)
+        # Provider fallback chain:
+        # 1) user-chosen (with provided api_key)
+        # 2) others via env keys (if present)
+        chain = self._provider_chain(provider, api_key)
+
+        # Local deterministic analysis + MaxiSynth plan
         analysis = self._analyze_input_text(text)
-        prompt = self._prompt_from_analysis(analysis, guidance, estimated)
+        plan = self._maxisynth_plan(analysis, guidance, target_slides=estimated)
 
-        # 2) LLM generation
-        try:
-            logger.info(f"Parsing with {provider}, estimated slides: {estimated}")
-            response = self._call_llm_with_retry(provider, api_key, prompt)
-            slides = self._robust_json_extraction(response)
-            slides = self._validate_and_enhance_slides(slides)
-        except Exception as e:
-            logger.warning(f"Primary generation failed: {e}")
-            slides = []
-
-        # 3) Sectional fallback if needed (handles 'Empty response' / light output)
-        if not slides or len(slides) < max(4, estimated - 1):
+        # Try providers in order
+        slides: List[Dict] = []
+        for prov, key in chain:
             try:
-                slides_sec = self._sectional_generate(provider, api_key, analysis, guidance, estimated)
-                slides_sec = self._validate_and_enhance_slides(slides_sec)
-                if self._score_slides(slides_sec) >= self._score_slides(slides):
-                    slides = slides_sec
+                logger.info(f"Parsing with {prov}, estimated slides: {estimated}")
+                # primary generation from plan
+                response = self._call_llm_with_retry(prov, key, self._prompt_from_plan(plan))
+                slides = self._robust_json_extraction(response)
+                slides = self._validate_and_enhance_slides(slides)
+
+                # if too light, try sectional generation (quota-aware)
+                if len(slides) < max(5, estimated - 1):
+                    sec = self._sectional_generate(prov, key, plan, estimated)
+                    sec = self._validate_and_enhance_slides(sec)
+                    if self._score_slides(sec) >= self._score_slides(slides):
+                        slides = sec
+
+                # one refinement pass
+                try:
+                    improved = self._refine_with_provider(prov, key, json.dumps({"slides": slides}), estimated + 2)
+                    slides2 = self._robust_json_extraction(improved)
+                    slides2 = self._validate_and_enhance_slides(slides2)
+                    if self._score_slides(slides2) >= self._score_slides(slides):
+                        slides = slides2
+                        logger.info(f"Refinement improved slides to {len(slides)}")
+                except Exception:
+                    logger.warning("Refinement pass failed; keeping initial slides")
+
+                if slides:
+                    break  # success
             except Exception as e:
-                logger.warning(f"Sectional fallback failed: {e}")
+                logger.warning(f"{prov} failed: {e}; trying next provider if available.")
 
-        # 4) One refinement pass for density/accuracy
-        if slides:
-            try:
-                improved = self._refine_with_provider(provider, api_key, json.dumps({"slides": slides}), estimated + 2)
-                slides2 = self._robust_json_extraction(improved)
-                slides2 = self._validate_and_enhance_slides(slides2)
-                if self._score_slides(slides2) >= self._score_slides(slides):
-                    slides = slides2
-                    logger.info(f"Refinement improved slides to {len(slides)}")
-            except Exception:
-                logger.warning("Refinement pass failed; keeping initial slides")
+        # If still empty, synthesize locally at max density
+        if not slides:
+            logger.warning("All providers failed/quota-limited; using MaxiSynth local generation")
+            slides = self._maxisynth_local_slides(plan, target=self.max_slides)
 
         # Ensure conclusion slide
         if not slides or slides[-1].get("slide_type") != "conclusion_slide":
@@ -169,15 +221,62 @@ class PPTGenerator:
         self._style_ctx = None
         return prs
 
-    # ========================== LOCAL ANALYSIS ==========================
+    # ========================== Provider chain & prompts ==========================
+
+    def _provider_chain(self, primary: str, primary_key: str) -> List[Tuple[str, str]]:
+        chain: List[Tuple[str, str]] = []
+        add = lambda prov, key: chain.append((prov, key)) if key else None
+
+        # primary from UI
+        add(primary, primary_key)
+
+        # environment fallbacks
+        if primary != "openai":
+            add("openai", os.environ.get("OPENAI_API_KEY"))
+        if primary != "anthropic":
+            add("anthropic", os.environ.get("ANTHROPIC_API_KEY"))
+        if primary != "google":
+            add("google", os.environ.get("GOOGLE_API_KEY"))
+
+        # de-dup by provider
+        dedup: List[Tuple[str, str]] = []
+        seen = set()
+        for p, k in chain:
+            if p not in seen and k:
+                dedup.append((p, k)); seen.add(p)
+        return dedup or [(primary, primary_key)]
+
+    def _prompt_from_plan(self, plan: Dict[str, Any]) -> str:
+        """LLM prompt grounded in MaxiSynth plan; JSON-only output."""
+        return f"""
+You are a presentation designer.
+
+Use ONLY the PLAN data to build slides. Do not invent facts outside PLAN.
+Return ONLY a JSON object (no markdown, no prose).
+
+STRUCTURE:
+- 1 title slide for the whole topic.
+- {plan.get('target_slides', 8)}±2 total slides.
+- Each content slide: 3–5 bullets, each < 15 words, concrete & action-oriented.
+- End with a conclusion slide.
+
+PLAN:
+{json.dumps(plan, ensure_ascii=False)[:9000]}
+
+JSON FORMAT:
+{{
+  "presentation_title": "Clear Title",
+  "slides": [
+    {{"title":"Welcome","content":["What this covers","Key value"],"slide_type":"title_slide","speaker_notes":"short"}},
+    {{"title":"Main Point","content":["Specific fact","Example","Action"],"slide_type":"content_slide","speaker_notes":"short"}},
+    {{"title":"Conclusion & Next Steps","content":["Summary","Next steps","Q&A"],"slide_type":"conclusion_slide","speaker_notes":"short"}}
+  ]
+}}
+""".strip()
+
+    # ========================== Local analysis & MaxiSynth ==========================
 
     def _analyze_input_text(self, text: str) -> Dict[str, Any]:
-        """
-        Deterministic, LLM-free pass:
-        - Title: H1 (# ), else first non-empty line, else first ~8 words of doc.
-        - Sections: split by ##/###; else blank-line chunks.
-        - Bullets: keep existing list items; extract key sentences.
-        """
         # Normalize CRLF & artifacts early
         t = text.replace("_x000D_", " ").replace("\r\n", "\n").replace("\r", "\n")
 
@@ -189,97 +288,235 @@ class PPTGenerator:
             first_line = next((ln.strip() for ln in t.split("\n") if ln.strip()), "")
             title = " ".join(first_line.split()[:12]) or "Presentation"
 
-        # Section detection
+        # Sections by ##/###; fallback to blank-line chunks
         section_headers = [(m.start(), m.group(0), m.group(1).strip())
                            for m in re.finditer(r"^\s*(##+)\s+(.+)$", t, re.MULTILINE)]
         sections: List[Dict[str, Any]] = []
         if section_headers:
-            # slice text between headers
             for idx, (pos, hashes, heading) in enumerate(section_headers):
                 start = pos + len(hashes) + 1 + len(heading)
                 end = section_headers[idx + 1][0] if idx + 1 < len(section_headers) else len(t)
                 body = t[start:end].strip()
-                sections.append(self._section_snapshot(heading, body))
+                sections.append({"heading": heading[:80], "text": body})
         else:
-            # fallback to paragraph chunks
             paras = [p.strip() for p in re.split(r"\n{2,}", t) if p.strip()]
-            for i, chunk in enumerate(paras[:10]):
-                heading = f"Section {i+1}"
-                sections.append(self._section_snapshot(heading, chunk))
+            for i, chunk in enumerate(paras[:12]):
+                sections.append({"heading": f"Section {i+1}", "text": chunk})
 
-        # Cap sections by heuristics
-        if len(sections) > 10:
-            sections = sections[:10]
+        # Facts/metrics/timeline harvesting
+        facts, nums, dates = self._harvest_facts(t)
 
-        return {"title": title, "sections": sections}
+        return {
+            "title": title,
+            "sections": sections[:10],
+            "facts": facts[:30],
+            "numbers": nums[:30],
+            "dates": dates[:20],
+        }
 
-    def _section_snapshot(self, heading: str, body: str) -> Dict[str, Any]:
-        lines = [ln.strip() for ln in body.split("\n") if ln.strip()]
-        bullets = [re.sub(r"^(\*|-|•|\d+\.)\s*", "", ln).strip() for ln in lines if re.match(r"^(\*|-|•|\d+\.)\s+", ln)]
-        # key sentences
-        sentences = re.split(r"(?<=[.!?])\s+", body)
-        key_sents = [s.strip() for s in sentences if len(s.strip()) > 30][:5]
-        # prefer bullets if present
-        picks = bullets[:5] if bullets else key_sents[:5]
-        return {"heading": heading[:80], "bullets": picks, "summary": " ".join(key_sents[:2])[:220]}
+    def _harvest_facts(self, text: str) -> Tuple[List[str], List[str], List[str]]:
+        # Numbers & metrics
+        nums = re.findall(r"\b(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?\b", text)
+        # Dates & simple timelines
+        date_patterns = [
+            r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+            r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[ ,.-]?\s?\d{1,2},?\s?\d{2,4}\b",
+            r"\b\d{4}-\d{2}-\d{2}\b",
+            r"\b(?:Q[1-4]\s*\d{4})\b",
+            r"\b\d{2}/\d{2}/\d{4}\b",
+        ]
+        dates = []
+        for dp in date_patterns:
+            dates += re.findall(dp, text, flags=re.IGNORECASE)
+        dates = list(dict.fromkeys(dates))
 
-    # ========================== PROMPTS ==========================
+        # Quick-and-dirty "facts": sentences with numbers or named entities (Capitalized sequences)
+        sents = re.split(r"(?<=[.!?])\s+", text)
+        facts = []
+        for s in sents:
+            if len(s) < 30:
+                continue
+            if re.search(r"\d", s) or re.search(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\b", s):
+                facts.append(s.strip())
 
-    def _prompt_from_analysis(self, analysis: Dict[str, Any], guidance: str, target_slides: int) -> str:
-        """LLM prompt grounded in local ANALYSIS; JSON only."""
+        return facts, nums, dates
+
+    def _maxisynth_plan(self, analysis: Dict[str, Any], guidance: str, target_slides: int) -> Dict[str, Any]:
+        """Build a rich slide plan we can hand to an LLM or use locally if LLM fails."""
+        title = analysis.get("title") or "Presentation"
+        secs = analysis.get("sections", [])
+        facts = analysis.get("facts", [])
+        nums = analysis.get("numbers", [])
+        dates = analysis.get("dates", [])
         style = guidance or "professional, clear, and engaging presentation"
-        # Keep analysis compact so Gemini doesn’t choke
-        analysis_json = self._compact_analysis_for_prompt(analysis, cap_chars=7000)
-        return f"""
-You are a presentation designer.
 
-Use ONLY the ANALYSIS below (derived from the user's text) to build slides.
-Do not invent facts that are not present in ANALYSIS.
-Return ONLY a JSON object (no markdown, no prose).
+        # Convert sections → bullets
+        sec_payload = []
+        for s in secs:
+            lines = [ln.strip() for ln in s.get("text","").split("\n") if ln.strip()]
+            bullets = [re.sub(r"^(\*|-|•|\d+\.)\s*", "", ln).strip() for ln in lines if re.match(r"^(\*|-|•|\d+\.)\s+", ln)]
+            if not bullets:
+                # key sentences
+                sentences = re.split(r"(?<=[.!?])\s+", s.get("text",""))
+                bullets = [x.strip() for x in sentences if len(x.strip()) > 30][:5]
+            sec_payload.append({"title": s["heading"], "bullets": bullets[:6]})
 
-STYLE: {style}
-STRUCTURE:
-- 1 title slide for the whole topic.
-- {target_slides}±2 total slides.
-- Each content slide: 3–5 bullets, each < 15 words, action-oriented.
-- End with a conclusion slide.
+        # Assemble auxiliary panels
+        key_metrics = list(dict.fromkeys(nums))[:12]
+        key_dates = dates[:10]
+        key_facts = facts[:12]
 
-ANALYSIS:
-{analysis_json}
+        return {
+            "topic": title,
+            "style": style,
+            "sections": sec_payload,
+            "key_metrics": key_metrics,
+            "key_dates": key_dates,
+            "key_facts": key_facts,
+            "target_slides": min(self.max_slides, max(target_slides, 8)),
+        }
 
-JSON FORMAT EXAMPLE:
-{{
-  "presentation_title": "Clear Title",
-  "slides": [
-    {{"title":"Welcome","content":["What this covers","Key value"],"slide_type":"title_slide","speaker_notes":"short"}},
-    {{"title":"Main Point","content":["Fact from analysis","Example","Action"],"slide_type":"content_slide","speaker_notes":"short"}},
-    {{"title":"Conclusion & Next Steps","content":["Summary","Next steps","Q&A"],"slide_type":"conclusion_slide","speaker_notes":"short"}}
-  ]
-}}
-""".strip()
+    def _maxisynth_local_slides(self, plan: Dict[str, Any], target: int) -> List[Dict]:
+        """Generate dense slides locally from the plan (no LLM)."""
+        slides: List[Dict] = []
+        topic = plan.get("topic", "Presentation")
 
-    def _compact_analysis_for_prompt(self, analysis: Dict[str, Any], cap_chars: int = 7000) -> str:
-        """Serialize analysis with a rough char budget."""
-        j = json.dumps(analysis, ensure_ascii=False)
-        return j[:cap_chars]
+        slides.append({
+            "title": topic,
+            "content": ["Overview", "Scope & objectives", "What you’ll learn"],
+            "slide_type": "title_slide",
+            "speaker_notes": f"Introduce {topic}"
+        })
 
-    # ========================== LLM CALLS ==========================
+        # Section slides
+        for sec in plan.get("sections", [])[:6]:
+            bullets = sec.get("bullets") or []
+            bullets = [b[:150] for b in bullets if b.strip()]
+            if not bullets:
+                continue
+            slides.append({
+                "title": sec.get("title", "Section"),
+                "content": bullets[:5],
+                "slide_type": "content_slide",
+                "speaker_notes": f"Discuss {sec.get('title','section')}"
+            })
+            if len(slides) >= target - 4:
+                break
+
+        # Facts
+        facts = plan.get("key_facts", [])
+        if facts:
+            slides.append({
+                "title": "Key Facts",
+                "content": [f[:150] for f in facts[:5]],
+                "slide_type": "content_slide",
+                "speaker_notes": "Highlight key facts"
+            })
+
+        # Metrics
+        metrics = plan.get("key_metrics", [])
+        if metrics:
+            slides.append({
+                "title": "Metrics & Figures",
+                "content": [m[:60] for m in metrics[:5]],
+                "slide_type": "content_slide",
+                "speaker_notes": "Explain the numbers"
+            })
+
+        # Timeline
+        if plan.get("key_dates"):
+            slides.append({
+                "title": "Timeline",
+                "content": plan["key_dates"][:5],
+                "slide_type": "content_slide",
+                "speaker_notes": "Walk through dates"
+            })
+
+        # FAQs (heuristic)
+        faqs = self._derive_faqs(plan)
+        if faqs:
+            slides.append({
+                "title": "FAQs",
+                "content": faqs[:5],
+                "slide_type": "content_slide",
+                "speaker_notes": "Answer common questions"
+            })
+
+        # Risks & mitigations
+        risks = self._derive_risks(plan)
+        if risks:
+            slides.append({
+                "title": "Risks & Mitigations",
+                "content": risks[:5],
+                "slide_type": "content_slide",
+                "speaker_notes": "Call out risks"
+            })
+
+        # Next steps
+        slides.append({
+            "title": "Next Steps",
+            "content": ["Assign owners", "Set milestones", "Share deck", "Kickoff meeting"],
+            "slide_type": "content_slide",
+            "speaker_notes": "Action plan"
+        })
+
+        return slides
+
+    def _derive_faqs(self, plan: Dict[str, Any]) -> List[str]:
+        faqs = []
+        # naive: questions from facts/sections; else generic
+        for f in plan.get("key_facts", []):
+            if "?" in f and len(faqs) < 5:
+                faqs.append(f)
+        if len(faqs) < 3:
+            faqs.extend(["Who is the target audience?",
+                         "What is the expected outcome?",
+                         "What are the success metrics?"])
+        return faqs
+
+    def _derive_risks(self, plan: Dict[str, Any]) -> List[str]:
+        risks = []
+        text_blobs = " ".join([" ".join(sec.get("bullets", [])) for sec in plan.get("sections", [])])
+        if re.search(r"\brisks?\b|\bchallenge(s)?\b|\bissue(s)?\b", text_blobs, re.IGNORECASE):
+            risks.append("Scope creep without clear milestones")
+            risks.append("Missing data or unclear ownership")
+        risks.append("Timeline slippage due to dependencies")
+        risks.append("Stakeholder misalignment")
+        risks.append("Insufficient testing before launch")
+        return risks
+
+    # ========================== LLM CALLS (with rate limiting) ==========================
 
     def _call_llm_with_retry(self, provider: str, api_key: str, prompt: str, max_retries: int = 2) -> str:
         last_err = None
         for attempt in range(max_retries + 1):
             try:
+                retry_after = None
+                if provider == "google":
+                    # Be nice to free-tier RPM
+                    rl.before_call("google")
+
                 if provider == "openai":
                     return self._call_openai(prompt, api_key)
                 if provider == "anthropic":
                     return self._call_anthropic(prompt, api_key)
                 if provider == "google":
                     return self._call_gemini(prompt, api_key)
+
                 raise ValueError(f"Unsupported provider: {provider}")
             except Exception as e:
                 last_err = e
+                msg = str(e)
+                # extract retry hint if present
+                m = re.search(r"retry[_ ]delay[^0-9]*([0-9]+)", msg, flags=re.IGNORECASE)
+                retry_after = int(m.group(1)) if m else None
+
                 if attempt < max_retries:
                     logger.warning(f"Attempt {attempt + 1} failed: {e}, retrying...")
+                    if provider == "google":
+                        rl.before_call("google", retry_after=retry_after)
+                else:
+                    break
         raise last_err or RuntimeError("LLM call failed")
 
     def _call_openai(self, prompt: str, api_key: str) -> str:
@@ -309,6 +546,8 @@ JSON FORMAT EXAMPLE:
     def _call_anthropic(self, prompt: str, api_key: str) -> str:
         try:
             client = anthropic.Anthropic(api_key=api_key)
+            # small gap to avoid Anthropic RPM bursts
+            rl.before_call("anthropic")
             resp = client.messages.create(
                 model="claude-opus-4-1",
                 max_tokens=1800,
@@ -362,36 +601,34 @@ JSON FORMAT EXAMPLE:
             msg = str(e)
             if "api key" in msg.lower():
                 raise ValueError("Invalid Google API key")
+            if "429" in msg or "rate limit" in msg.lower() or "quota" in msg.lower():
+                raise ValueError("Google rate limit exceeded")
             if "500" in msg:
                 raise ValueError("Google error: transient server issue (500). Please retry.")
             raise
 
-    # ======= Sectional fallback: small prompts per section when main call is weak =======
+    # ======= Sectional fallback =======
 
-    def _sectional_generate(self, provider: str, api_key: str, analysis: Dict[str, Any],
-                            guidance: str, target_slides: int) -> List[Dict]:
-        sections = analysis.get("sections", [])[: self.section_call_cap]
+    def _sectional_generate(self, provider: str, api_key: str, plan: Dict[str, Any], target_slides: int) -> List[Dict]:
+        sections = plan.get("sections", [])[: self.section_call_cap]
         slides: List[Dict] = []
-        style = guidance or "professional, clear, and engaging presentation"
+        topic = plan.get("topic") or "Presentation"
 
-        # Title slide from analysis
-        title = analysis.get("title") or "Presentation"
         slides.append({
-            "title": title,
-            "content": [f"Overview of {title}", "Key takeaways", "Agenda"],
+            "title": topic,
+            "content": [f"Overview of {topic}", "Key takeaways", "Agenda"],
             "slide_type": "title_slide",
-            "speaker_notes": f"Introduce {title}"
+            "speaker_notes": f"Introduce {topic}"
         })
 
-        per_section = max(1, min(2, target_slides // max(1, len(sections))))  # 1–2 slides / section
+        per_section = max(1, min(2, target_slides // max(1, len(sections))))
 
         for sec in sections:
             sec_prompt = f"""
-Build JSON slides ONLY for the SECTION, grounded strictly in its bullets/summary.
+Build JSON slides ONLY for the SECTION, grounded strictly in its bullets.
 No markdown, no prose. JSON only.
 
-STYLE: {style}
-OUTPUT: {per_section} content slide(s) with 3–5 bullets each (<15 words).
+OUTPUT: {per_section} content slide(s), each with 3–5 bullets (<15 words).
 SECTION:
 {json.dumps(sec, ensure_ascii=False)[:2500]}
 
@@ -399,6 +636,12 @@ JSON FORMAT:
 {{"slides":[{{"title":"...","content":["..."],"slide_type":"content_slide","speaker_notes":"short"}}]}}
 """.strip()
             try:
+                # Respect RPM
+                if provider == "google":
+                    rl.before_call("google")
+                elif provider == "anthropic":
+                    rl.before_call("anthropic")
+
                 if provider == "openai":
                     out = self._call_openai(sec_prompt, api_key)
                 elif provider == "anthropic":
@@ -411,12 +654,14 @@ JSON FORMAT:
                     if ss.get("slide_type") == "title_slide":
                         ss["slide_type"] = "content_slide"
                 slides.extend(sec_slides)
-                if len(slides) >= self.max_slides - 1:  # leave space for conclusion
+                if len(slides) >= self.max_slides - 1:
                     break
             except Exception as e:
                 logger.warning(f"Sectional gen error: {e}; continuing.")
+                # On quota, bail early to avoid more errors
+                if "rate limit" in str(e).lower() or "quota" in str(e).lower():
+                    break
 
-        # Add conclusion
         slides.append({
             "title": "Conclusion & Next Steps",
             "content": ["Summary of key points", "Actionable next steps", "Q&A"],
@@ -429,20 +674,17 @@ JSON FORMAT:
 
     def _robust_json_extraction(self, response: str) -> List[Dict]:
         cleaned = (response or "").strip()
-        # Strip fences
         if cleaned.startswith("```"):
             cleaned = cleaned.strip("`").strip()
             if cleaned.lower().startswith("json"):
                 cleaned = cleaned[4:].strip()
 
-        # Extract outer JSON containing "slides"
         match = re.search(r"\{.*\"slides\".*\}[\s\S]*$", cleaned)
         candidate = match.group(0) if match else cleaned
 
         try:
             data = json.loads(candidate)
         except Exception:
-            # Try extracting just the slides array
             arr = re.search(r"\"slides\"\s*:\s*(\[[\s\S]*?\])", cleaned)
             if arr:
                 try:
@@ -487,7 +729,6 @@ JSON FORMAT:
         return out[: self.max_slides]
 
     def _md_to_slides(self, text: str) -> List[Dict]:
-        # Minimal markdown fallback
         lines = (text or "").splitlines()
         slides: List[Dict] = []
         cur: Optional[Dict] = None
@@ -543,37 +784,6 @@ JSON FORMAT:
                 "speaker_notes": "Wrap up",
             })
         return slides
-
-    def _score_slides(self, slides: List[Dict]) -> float:
-        counts, n = 0, 0
-        for i, s in enumerate(slides):
-            if s.get("slide_type") == "title_slide" or i == 0:
-                continue
-            b = [x for x in (s.get("content") or []) if x and x.strip()]
-            counts += len(b)
-            n += 1
-        return (counts / max(n, 1)) if n else 0.0
-
-    def _refine_with_provider(self, provider: str, api_key: str, prior_json: str, target_slides: int) -> str:
-        refine_prompt = f"""
-You previously returned this JSON presentation:
-
-{prior_json}
-
-Improve it:
-- Keep JSON only (no markdown).
-- Ensure 1 title slide, >= {max(4, target_slides)} total slides, and a clear conclusion.
-- For each content slide, include 3–5 action-oriented bullets (<15 words each).
-- Prefer concrete, specific bullets over generic statements.
-Return ONLY the JSON object.
-""".strip()
-        if provider == "openai":
-            return self._call_openai(refine_prompt, api_key)
-        if provider == "anthropic":
-            return self._call_anthropic(refine_prompt, api_key)
-        if provider == "google":
-            return self._call_gemini(refine_prompt, api_key)
-        raise ValueError(f"Unsupported provider for refine: {provider}")
 
     # ========================== CLEANING & DEFAULTS ==========================
 
@@ -654,7 +864,7 @@ Return ONLY the JSON object.
         return paginated
 
     def _safe_rect(self, prs: Presentation) -> Tuple[Emu, Emu, Emu, Emu]:
-        sw, sh = prs.slide_width, prs.slide_height  # EMU
+        sw, sh = prs.slide_width, prs.slide_height
         margin_x = Emu(Inches(0.8))
         top = Emu(Inches(1.6))
         bottom = Emu(Inches(0.8))
