@@ -515,7 +515,7 @@ JSON FORMAT:
         """
         try:
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel("gemini-2.5-pro")  # CHANGED model
+            model = genai.GenerativeModel("gemini-2.5-flash")  # CHANGED model
             gen_cfg = {
                 "temperature": 0.1,
                 "max_output_tokens": 5000,   # keep per your request
