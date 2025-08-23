@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-Auto PPT Generator - Robust LLM parsing, enhanced prompting, improved content processing,
-and safer slide creation with template reuse (styles + images). Keeps index.html unchanged.
+Auto PPT Generator - Robust LLM parsing (Gemini JSON mode, no Schema hard-dep),
+enhanced prompting, markdown-aware fallback, style & image reuse from uploaded deck,
+and in-memory download. Keeps index.html unchanged.
+
+Behavior with uploads:
+- If user uploads a .pptx/.potx, we PRESERVE existing slides from that file
+  and APPEND the newly generated slides to the end (as requested).
+- We extract fonts/colors and pictures from the uploaded file and apply/reuse them.
 """
 
 import os
@@ -65,6 +71,19 @@ class PPTGenerator:
             response = self._call_llm_with_retry(provider, api_key, prompt)
             slides = self._robust_json_extraction(response)
             slides = self._validate_and_enhance_slides(slides)
+
+            # Quality gate: if too light, do one refinement pass with the same provider
+            if self._score_slides(slides) < 3.0 or len(slides) < max(4, estimated_slides - 1):
+                try:
+                    improved = self._refine_with_provider(provider, api_key, response, estimated_slides + 2)
+                    slides2 = self._robust_json_extraction(improved)
+                    slides2 = self._validate_and_enhance_slides(slides2)
+                    if self._score_slides(slides2) >= self._score_slides(slides):
+                        slides = slides2
+                        logger.info(f"Refinement improved slides to {len(slides)}")
+                except Exception:
+                    logger.warning("Refinement pass failed; keeping initial slides")
+
             # ensure a conclusion slide exists at the end
             if not slides or slides[-1].get("slide_type") != "conclusion_slide":
                 slides.append(
@@ -84,14 +103,18 @@ class PPTGenerator:
             return slides[: self.max_slides]
 
     def create_presentation(self, slides_data: List[Dict], template_file: Optional[str] = None) -> Presentation:
-        """Create a PPTX from normalized slide data, safely reusing optional template."""
+        """Create a PPTX from normalized slide data.
+
+        If a PPTX/POTX is uploaded:
+        - Extract style & assets.
+        - PRESERVE existing slides from the upload.
+        - APPEND the generated slides after them.
+        """
         try:
             if template_file:
                 prs = Presentation(template_file)
                 style = self._extract_style_and_assets(prs)
-                if len(prs.slides) > 0:
-                    self._safely_clear_slides(prs)
-                logger.info("Using uploaded template")
+                logger.info("Using uploaded template/presentation (preserving existing slides, appending new)")
             else:
                 prs = Presentation()
                 style = {
@@ -250,51 +273,64 @@ CONTENT:
             raise ValueError(f"Anthropic error: {str(e)}")
 
     def _call_google_enhanced(self, prompt: str, api_key: str) -> str:
-        """Gemini 2.5 Pro with JSON schema & parts aggregation (no response.text quick accessor)."""
+        """
+        Gemini 2.5 Pro with JSON mode.
+        - Version-agnostic: If genai.types.Schema exists, use it; else fallback to MIME-only JSON mode.
+        - Always aggregate from candidates[].content.parts[] (never rely solely on response.text).
+        - max_output_tokens set to 4000 as requested.
+        """
         try:
             genai.configure(api_key=api_key)
-
-            # JSON-mode schema to reduce refusals/empty candidates
-            schema = genai.types.Schema(
-                type=genai.types.Type.OBJECT,
-                properties={
-                    "presentation_title": genai.types.Schema(type=genai.types.Type.STRING),
-                    "slides": genai.types.Schema(
-                        type=genai.types.Type.ARRAY,
-                        items=genai.types.Schema(
-                            type=genai.types.Type.OBJECT,
-                            properties={
-                                "title": genai.types.Schema(type=genai.types.Type.STRING),
-                                "content": genai.types.Schema(
-                                    type=genai.types.Type.ARRAY, items=genai.types.Schema(type=genai.types.Type.STRING)
-                                ),
-                                "slide_type": genai.types.Schema(type=genai.types.Type.STRING),
-                                "speaker_notes": genai.types.Schema(type=genai.types.Type.STRING),
-                            },
-                            required=["title", "content", "slide_type"],
-                        ),
-                    ),
-                },
-                required=["slides"],
-            )
-
             model = genai.GenerativeModel("gemini-2.5-pro")
-            resp = model.generate_content(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.2,
-                    max_output_tokens=1800,
-                    candidate_count=1,
-                    response_mime_type="application/json",
-                    response_schema=schema,
-                ),
-            )
+
+            # Try to build a schema if this SDK version supports it
+            response_schema = None
+            try:
+                if hasattr(genai, "types") and hasattr(genai.types, "Schema") and hasattr(genai.types, "Type"):
+                    Schema, Type = genai.types.Schema, genai.types.Type
+                    response_schema = Schema(
+                        type=Type.OBJECT,
+                        properties={
+                            "presentation_title": Schema(type=Type.STRING),
+                            "slides": Schema(
+                                type=Type.ARRAY,
+                                items=Schema(
+                                    type=Type.OBJECT,
+                                    properties={
+                                        "title": Schema(type=Type.STRING),
+                                        "content": Schema(type=Type.ARRAY, items=Schema(type=Type.STRING)),
+                                        "slide_type": Schema(type=Type.STRING),
+                                        "speaker_notes": Schema(type=Type.STRING),
+                                    },
+                                    required=["title", "content", "slide_type"],
+                                ),
+                            ),
+                        },
+                        required=["slides"],
+                    )
+            except Exception:
+                response_schema = None  # fall back if building schema fails
+
+            gen_cfg = {
+                "temperature": 0.15,
+                "max_output_tokens": 4000,   # <= per your request
+                "candidate_count": 1,
+                "response_mime_type": "application/json",
+            }
+            if response_schema is not None:
+                gen_cfg["response_schema"] = response_schema
+
+            resp = model.generate_content(prompt, generation_config=gen_cfg)
 
             # Aggregate JSON from parts
-            texts: List[str] = []
+            texts = []
             for cand in getattr(resp, "candidates", []) or []:
+                # Optional: handle blocked/other finish reasons
+                fr = getattr(cand, "finish_reason", None)
+                if getattr(fr, "name", None) in {"SAFETY", "OTHER"}:
+                    raise ValueError("Google error: response blocked; simplify content or reduce length.")
                 content = getattr(cand, "content", None)
-                for part in getattr(content, "parts", []) or []:
+                for part in (getattr(content, "parts", None) or []):
                     t = getattr(part, "text", None)
                     if t:
                         texts.append(t)
@@ -302,16 +338,20 @@ CONTENT:
             if not texts and getattr(resp, "text", None):
                 texts.append(resp.text)
 
-            text = ("\n".join(texts)).strip()
-            if not text:
+            out = ("\n".join(texts)).strip()
+            if not out:
                 raise ValueError("Empty response from Google")
-            return text
+            return out
+
         except Exception as e:
             msg = str(e)
             if "api key" in msg.lower():
                 raise ValueError("Invalid Google API key")
             if "500" in msg:
                 raise ValueError("Google error: transient server issue (500). Please retry.")
+            if "has no attribute 'Schema'" in msg:
+                # Hide SDK mismatch behind a clean message (we already fell back to MIME mode)
+                raise ValueError("Google error: This SDK lacks JSON schema helpers; JSON mode fallback used. Try again.")
             raise ValueError(f"Google error: {msg}")
 
     # ------------------------------ Parsing & Validation ------------------------------
@@ -464,10 +504,48 @@ CONTENT:
 
     # ------------------------------ Utilities & Fallbacks ------------------------------
 
+    def _score_slides(self, slides: List[Dict]) -> float:
+        """Simple heuristic: average bullets per non-title slide; penalize empties."""
+        if not slides:
+            return 0.0
+        counts, n = 0, 0
+        for i, s in enumerate(slides):
+            if s.get("slide_type") == "title_slide" or i == 0:
+                continue
+            b = [x for x in (s.get("content") or []) if x and x.strip()]
+            counts += len(b)
+            n += 1
+        return (counts / max(n, 1)) if n else 0.0
+
+    def _refine_with_provider(self, provider: str, api_key: str, prior_json: str, target_slides: int) -> str:
+        """Ask the same provider to densify bullets and increase slide count if light."""
+        refine_prompt = f"""
+You previously returned this JSON presentation:
+
+{prior_json}
+
+Improve it:
+- Keep JSON only (no markdown).
+- Ensure 1 title slide, >= {max(4, target_slides)} total slides, and a clear conclusion.
+- For each content slide, include 3–5 action-oriented bullets (<15 words each).
+- Prefer concrete, specific bullets over generic statements.
+Return ONLY the JSON object.
+""".strip()
+        if provider == "openai":
+            return self._call_openai_enhanced(refine_prompt, api_key)
+        if provider == "anthropic":
+            return self._call_anthropic_enhanced(refine_prompt, api_key)
+        if provider == "google":
+            return self._call_google_enhanced(refine_prompt, api_key)
+        raise ValueError(f"Unsupported provider for refine: {provider}")
+
     def _clean_text(self, text: str) -> str:
         if not text:
             return ""
+        # Normalize Windows CRLF artifacts that sometimes leak from copied text/HTML
+        text = text.replace("_x000D_", " ").replace("\r\n", " ").replace("\r", " ")
         cleaned = re.sub(r"\s+", " ", text.strip())
+        # Keep common punctuation; strip control chars/odd glyphs
         cleaned = re.sub(r"[^\w\s\-.,!?()&%$#@:/]", "", cleaned)
         return cleaned
 
@@ -544,7 +622,7 @@ CONTENT:
     def _extract_style_and_assets(self, prs: Presentation) -> dict:
         """
         Heuristically extract title/body font names, primary colors, and picture assets
-        from the uploaded PPTX/POTX before slides are cleared.
+        from the uploaded PPTX/POTX (without removing its slides).
         """
         style = {
             "title_font": None,
@@ -576,7 +654,7 @@ CONTENT:
         except Exception:
             pass
 
-        # Harvest picture assets (from all slides)
+        # Harvest picture assets (from all existing slides)
         try:
             for s in prs.slides:
                 for shp in s.shapes:
@@ -596,21 +674,6 @@ CONTENT:
         return style
 
     # ------------------------------ PPT Creation Helpers ------------------------------
-
-    def _safely_clear_slides(self, prs: Presentation):
-        """
-        Properly remove existing slides from a template:
-        - drop relationships and sldId entries
-        - avoids duplicate slideX.xml warnings when saving
-        """
-        try:
-            for idx in range(len(prs.slides) - 1, -1, -1):
-                sldId = prs.slides._sldIdLst[idx]
-                rId = sldId.rId
-                prs.part.drop_rel(rId)
-                prs.slides._sldIdLst.remove(sldId)
-        except Exception as e:
-            logger.warning(f"Could not clear template slides safely: {e}")
 
     def _create_enhanced_slide(self, prs: Presentation, slide_data: Dict, index: int):
         # Choose layout
