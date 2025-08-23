@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Auto PPT Generator - Robust LLM parsing (Gemini JSON mode, no Schema hard-dep),
-enhanced prompting, markdown-aware fallback, template-preserving append,
-style & image reuse from uploaded deck, adaptive layout to keep text inside slide,
-and in-memory download. Keeps index.html unchanged.
+Auto PPT Generator — Single-provider only (no env fallbacks), rate-limit aware,
+and robust parsing/rendering to keep text inside slides and maximize output.
 
-Behavior with uploads:
-- If user uploads a .pptx/.potx, we PRESERVE its existing slides
-  and APPEND LLM-generated slides to the end.
-- We extract fonts/colors and pictures from the uploaded file and apply/reuse them.
+- Uses ONLY the provider + API key from the form (no env-key fallbacks)
+- Gemini 2.5 Pro JSON mode, max_output_tokens=4000; no response.text
+- Sectional generation + local MaxiSynth to maximize slide count/details
+- Safe margins, autosize, adaptive font, pagination to avoid text overflow
 """
 
 import os
 import re
 import json
+import time
+import random
 import tempfile
 import logging
 from io import BytesIO
@@ -47,36 +47,93 @@ app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB uploads
 
 
 # ------------------------------------------------------------------------------
+# Simple rate limiter (best-effort per-process)
+# ------------------------------------------------------------------------------
+class RateLimiter:
+    """
+    Per-provider best-effort limiter to avoid burst 429s.
+    Defaults (can override via env):
+      - google: RPM=5  (Gemini 2.5 Pro free tier)
+      - openai: RPM=30
+      - anthropic: RPM=10
+    """
+
+    def __init__(self):
+        self.last_call_at: Dict[str, float] = {}
+        self.rpm = {
+            "google": int(os.environ.get("GEMINI_RPM", "5")),   # was 2
+            "openai": int(os.environ.get("OPENAI_RPM", "30")),
+            "anthropic": int(os.environ.get("ANTHROPIC_RPM", "10")),
+        }
+
+    def before_call(self, provider: str, retry_after: Optional[int] = None):
+        now = time.time()
+        rpm = self.rpm.get(provider, 10)
+        min_gap = 60.0 / max(rpm, 1)
+        last = self.last_call_at.get(provider, 0)
+
+        # If server suggested retry_after, prefer it (with jitter)
+        if retry_after and retry_after > 0:
+            sleep_for = retry_after + random.uniform(0.2, 0.8)
+            logger.info(f"[RL] Sleeping {sleep_for:.1f}s due to server retry_after for {provider}")
+            time.sleep(sleep_for)
+        else:
+            gap = (last + min_gap) - now
+            if gap > 0:
+                sleep_for = gap + random.uniform(0.05, 0.25)
+                logger.info(f"[RL] Throttling {provider} for {sleep_for:.2f}s to respect RPM={rpm}")
+                time.sleep(sleep_for)
+        self.last_call_at[provider] = time.time()
+
+
+rl = RateLimiter()
+
+
+# ------------------------------------------------------------------------------
 # PPT Generator
 # ------------------------------------------------------------------------------
 class PPTGenerator:
-    """PowerPoint generator with robust JSON/markdown parsing and safe template reuse."""
-
     def __init__(self):
         self.supported_providers = ["openai", "anthropic", "google"]
         self.max_slides = 12
         self.min_slides = 3
         self._style_ctx: Optional[dict] = None
+        self.section_call_cap = 5  # global cap for sectionals
 
-    # ------------------------------ Public API ------------------------------
+    # ========================== PUBLIC ENTRYPOINTS ==========================
 
     def parse_text_to_slides(
         self, text: str, provider: str, api_key: str, guidance: str = ""
     ) -> List[Dict]:
-        """Parse raw text into normalized slide dicts using an LLM with robust fallbacks."""
-        word_count = len((text or "").split())
-        estimated_slides = max(self.min_slides, min(self.max_slides, word_count // 120 + 1))
-        prompt = self._create_enhanced_prompt(text, guidance, estimated_slides)
+        """
+        Read-first pipeline, using ONLY the chosen provider+key.
+        """
+        text = (text or "").strip()
+        word_count = len(text.split())
+        estimated = max(self.min_slides, min(self.max_slides, word_count // 120 + 1))
 
+        # Local deterministic analysis + MaxiSynth plan
+        analysis = self._analyze_input_text(text)
+        plan = self._maxisynth_plan(analysis, guidance, target_slides=estimated)
+
+        slides: List[Dict] = []
         try:
-            logger.info(f"Parsing with {provider}, estimated slides: {estimated_slides}")
-            response = self._call_llm_with_retry(provider, api_key, prompt)
+            logger.info(f"Parsing with {provider}, estimated slides: {estimated}")
+            # Primary generation from plan
+            response = self._call_llm_with_retry(provider, api_key, self._prompt_from_plan(plan))
             slides = self._robust_json_extraction(response)
             slides = self._validate_and_enhance_slides(slides)
 
-            # Always try one refinement pass for denser, more accurate bullets
+            # If thin, try sectional generation (quota-aware) with same provider
+            if len(slides) < max(5, estimated - 1):
+                sec = self._sectional_generate(provider, api_key, plan, estimated)
+                sec = self._validate_and_enhance_slides(sec)
+                if self._score_slides(sec) >= self._score_slides(slides):
+                    slides = sec
+
+            # Single refinement pass (same provider)
             try:
-                improved = self._refine_with_provider(provider, api_key, response, estimated_slides + 2)
+                improved = self._refine_with_provider(provider, api_key, json.dumps({"slides": slides}), estimated + 2)
                 slides2 = self._robust_json_extraction(improved)
                 slides2 = self._validate_and_enhance_slides(slides2)
                 if self._score_slides(slides2) >= self._score_slides(slides):
@@ -84,33 +141,30 @@ class PPTGenerator:
                     logger.info(f"Refinement improved slides to {len(slides)}")
             except Exception:
                 logger.warning("Refinement pass failed; keeping initial slides")
-
-            # ensure a conclusion slide exists at the end
-            if not slides or slides[-1].get("slide_type") != "conclusion_slide":
-                slides.append(
-                    {
-                        "title": "Conclusion & Next Steps",
-                        "content": ["Summary of key points", "Actionable next steps", "Q&A"],
-                        "slide_type": "conclusion_slide",
-                        "speaker_notes": "Wrap up",
-                    }
-                )
-            logger.info(f"Generated {len(slides)} slides successfully")
-            return slides[: self.max_slides]
         except Exception as e:
-            logger.error(f"Error parsing text: {e}")
-            logger.warning("Using emergency fallback parsing")
-            slides = self._emergency_fallback_parsing(text)
-            return slides[: self.max_slides]
+            logger.warning(f"Primary generation failed: {e}")
+
+        # If still empty, synthesize locally at max density
+        if not slides:
+            logger.warning("LLM failed/quota-limited; using MaxiSynth local generation")
+            slides = self._maxisynth_local_slides(plan, target=self.max_slides)
+
+        # Ensure conclusion slide
+        if not slides or slides[-1].get("slide_type") != "conclusion_slide":
+            slides.append(
+                {
+                    "title": "Conclusion & Next Steps",
+                    "content": ["Summary of key points", "Actionable next steps", "Q&A"],
+                    "slide_type": "conclusion_slide",
+                    "speaker_notes": "Wrap up",
+                }
+            )
+
+        logger.info(f"Generated {len(slides)} slides successfully")
+        return slides[: self.max_slides]
 
     def create_presentation(self, slides_data: List[Dict], template_file: Optional[str] = None) -> Presentation:
-        """Create a PPTX from normalized slide data.
-
-        If a PPTX/POTX is uploaded:
-        - Extract style & assets.
-        - PRESERVE existing slides from the upload.
-        - APPEND the generated slides after them.
-        """
+        """Preserve uploaded deck, append generated slides; reuse styles & images."""
         try:
             if template_file:
                 prs = Presentation(template_file)
@@ -133,103 +187,289 @@ class PPTGenerator:
                 "images": []
             }
 
-        # Pagination + long-bullet splitting before rendering
+        # Pre-render shaping to avoid overflow
         slides_data = self._split_long_bullets(slides_data)
         slides_data = self._paginate_content(slides_data)
 
-        # keep style context for helpers
         self._style_ctx = style
-        for i, slide_data in enumerate(slides_data):
+        for i, s in enumerate(slides_data):
             try:
-                self._create_enhanced_slide(prs, slide_data, i)
-                # opportunistic image reuse from template assets (position safely)
+                self._create_enhanced_slide(prs, s, i)
                 if self._style_ctx["images"]:
-                    img_path = self._style_ctx["images"][i % len(self._style_ctx["images"])]
+                    img = self._style_ctx["images"][i % len(self._style_ctx["images"])]
                     try:
-                        self._place_logo_safe(prs, prs.slides[-1], img_path, slide_data.get("slide_type") == "title_slide")
+                        self._place_logo_safe(prs, prs.slides[-1], img, s.get("slide_type") == "title_slide")
                     except Exception:
                         pass
             except Exception as e:
                 logger.error(f"Error creating slide {i}: {e}")
-                self._create_fallback_slide(prs, slide_data, i)
+                self._create_fallback_slide(prs, s, i)
         self._style_ctx = None
         return prs
 
-    # ------------------------------ Prompting ------------------------------
+    # ========================== (Helpers) scoring & refine ==========================
 
-    def _create_enhanced_prompt(self, text: str, guidance: str, target_slides: int) -> str:
-        """JSON-only prompt with tight schema and clear constraints."""
-        style_guidance = guidance or "professional, clear, and engaging presentation"
-        return f"""You are a presentation designer. Convert the CONTENT into a JSON object ONLY.
-Rules:
-- Return ONLY valid JSON (no markdown, code fences, or prose).
-- JSON must follow the exact schema shown below.
-- Style: {style_guidance}
-- 1 title slide, 1+ content slides, and a conclusion slide.
-- Each slide has 3–5 bullet points, each < 15 words, action oriented.
-- Target slides: {target_slides} (±2 permitted).
+    def _score_slides(self, slides: List[Dict]) -> int:
+        score = 0
+        for s in slides:
+            score += min(5, len(s.get("content") or []))
+            if s.get("slide_type") == "conclusion_slide":
+                score += 1
+        return score
 
-JSON SCHEMA (example keys, replace placeholders with real content):
+    def _refine_with_provider(self, provider: str, api_key: str, slides_json: str, target: int) -> str:
+        prompt = f"""
+You are refining slides. Improve clarity and actionability. Keep JSON schema identical.
+- Total slides ~{target} (±2)
+- Each slide: 3–5 concise bullets (<15 words), concrete
+- Keep 'slide_type' values; ensure last is 'conclusion_slide'
+- Do not add markdown; JSON only
+INPUT:
+{slides_json}
+""".strip()
+        return self._call_llm_with_retry(provider, api_key, prompt)
+
+    # ========================== Prompts and local planning ==========================
+
+    def _prompt_from_plan(self, plan: Dict[str, Any]) -> str:
+        return f"""
+You are a presentation designer.
+
+Use ONLY the PLAN data to build slides. Do not invent facts outside PLAN.
+Return ONLY a JSON object (no markdown, no prose).
+
+STRUCTURE:
+- 1 title slide for the whole topic.
+- {plan.get('target_slides', 8)}±2 total slides.
+- Each content slide: 3–5 bullets, each < 15 words, concrete & action-oriented.
+- End with a conclusion slide.
+
+PLAN:
+{json.dumps(plan, ensure_ascii=False)[:9000]}
+
+JSON FORMAT:
 {{
-  "presentation_title": "Clear, Compelling Title",
+  "presentation_title": "Clear Title",
   "slides": [
-    {{
-      "title": "Welcome to [Topic]",
-      "content": ["Opening statement", "Key agenda point", "What audience will learn"],
-      "slide_type": "title_slide",
-      "speaker_notes": "Short note"
-    }},
-    {{
-      "title": "Main Point Title",
-      "content": ["Key insight", "Supporting detail", "Example", "Action item"],
-      "slide_type": "content_slide",
-      "speaker_notes": "Short note"
-    }},
-    {{
-      "title": "Conclusion & Next Steps",
-      "content": ["Summary of key points", "Actionable next steps", "Q&A"],
-      "slide_type": "conclusion_slide",
-      "speaker_notes": "Short note"
-    }}
+    {{"title":"Welcome","content":["What this covers","Key value"],"slide_type":"title_slide","speaker_notes":"short"}},
+    {{"title":"Main Point","content":["Specific fact","Example","Action"],"slide_type":"content_slide","speaker_notes":"short"}},
+    {{"title":"Conclusion & Next Steps","content":["Summary","Next steps","Q&A"],"slide_type":"conclusion_slide","speaker_notes":"short"}}
   ]
 }}
+""".strip()
 
-CONTENT:
-{text[:8000]}
-"""
+    def _analyze_input_text(self, text: str) -> Dict[str, Any]:
+        t = text.replace("_x000D_", " ").replace("\r\n", "\n").replace("\r", "\n")
 
-    # ------------------------------ LLM Calls ------------------------------
+        title_match = re.search(r"^\s*#\s+(.+)$", t, re.MULTILINE)
+        if title_match:
+            title = title_match.group(1).strip()
+        else:
+            first_line = next((ln.strip() for ln in t.split("\n") if ln.strip()), "")
+            title = " ".join(first_line.split()[:12]) or "Presentation"
+
+        section_headers = [(m.start(), m.group(0), m.group(1).strip())
+                           for m in re.finditer(r"^\s*(##+)\s+(.+)$", t, re.MULTILINE)]
+        sections: List[Dict[str, Any]] = []
+        if section_headers:
+            for idx, (pos, hashes, heading) in enumerate(section_headers):
+                start = pos + len(hashes) + 1 + len(heading)
+                end = section_headers[idx + 1][0] if idx + 1 < len(section_headers) else len(t)
+                body = t[start:end].strip()
+                sections.append({"heading": heading[:80], "text": body})
+        else:
+            paras = [p.strip() for p in re.split(r"\n{2,}", t) if p.strip()]
+            for i, chunk in enumerate(paras[:12]):
+                sections.append({"heading": f"Section {i+1}", "text": chunk})
+
+        facts, nums, dates = self._harvest_facts(t)
+        return {
+            "title": title,
+            "sections": sections[:10],
+            "facts": facts[:30],
+            "numbers": nums[:30],
+            "dates": dates[:20],
+        }
+
+    def _harvest_facts(self, text: str) -> Tuple[List[str], List[str], List[str]]:
+        nums = re.findall(r"\b(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?\b", text)
+        date_patterns = [
+            r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+            r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[ ,.-]?\s?\d{1,2},?\s?\d{2,4}\b",
+            r"\b\d{4}-\d{2}-\d{2}\b",
+            r"\b(?:Q[1-4]\s*\d{4})\b",
+            r"\b\d{2}/\d{2}/\d{4}\b",
+        ]
+        dates = []
+        for dp in date_patterns:
+            dates += re.findall(dp, text, flags=re.IGNORECASE)
+        dates = list(dict.fromkeys(dates))
+
+        sents = re.split(r"(?<=[.!?])\s+", text)
+        facts = []
+        for s in sents:
+            if len(s) < 30:
+                continue
+            if re.search(r"\d", s) or re.search(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\b", s):
+                facts.append(s.strip())
+
+        return facts, nums, dates
+
+    def _maxisynth_plan(self, analysis: Dict[str, Any], guidance: str, target_slides: int) -> Dict[str, Any]:
+        title = analysis.get("title") or "Presentation"
+        secs = analysis.get("sections", [])
+        facts = analysis.get("facts", [])
+        nums = analysis.get("numbers", [])
+        dates = analysis.get("dates", [])
+        style = guidance or "professional, clear, and engaging presentation"
+
+        sec_payload = []
+        for s in secs:
+            lines = [ln.strip() for ln in s.get("text","").split("\n") if ln.strip()]
+            bullets = [re.sub(r"^(\*|-|•|\d+\.)\s*", "", ln).strip()
+                       for ln in lines if re.match(r"^(\*|-|•|\d+\.)\s+", ln)]
+            if not bullets:
+                sentences = re.split(r"(?<=[.!?])\s+", s.get("text",""))
+                bullets = [x.strip() for x in sentences if len(x.strip()) > 30][:5]
+            sec_payload.append({"title": s["heading"], "bullets": bullets[:6]})
+
+        key_metrics = list(dict.fromkeys(nums))[:12]
+        key_dates = dates[:10]
+        key_facts = facts[:12]
+
+        return {
+            "topic": title,
+            "style": style,
+            "sections": sec_payload,
+            "key_metrics": key_metrics,
+            "key_dates": key_dates,
+            "key_facts": key_facts,
+            "target_slides": min(self.max_slides, max(target_slides, 8)),
+        }
+
+    def _maxisynth_local_slides(self, plan: Dict[str, Any], target: int) -> List[Dict]:
+        slides: List[Dict] = []
+        topic = plan.get("topic", "Presentation")
+
+        slides.append({
+            "title": topic,
+            "content": ["Overview", "Scope & objectives", "What you’ll learn"],
+            "slide_type": "title_slide",
+            "speaker_notes": f"Introduce {topic}"
+        })
+
+        for sec in plan.get("sections", [])[:6]:
+            bullets = sec.get("bullets") or []
+            bullets = [b[:150] for b in bullets if b.strip()]
+            if not bullets:
+                continue
+            slides.append({
+                "title": sec.get("title", "Section"),
+                "content": bullets[:5],
+                "slide_type": "content_slide",
+                "speaker_notes": f"Discuss {sec.get('title','section')}"
+            })
+            if len(slides) >= target - 4:
+                break
+
+        facts = plan.get("key_facts", [])
+        if facts:
+            slides.append({"title": "Key Facts", "content": [f[:150] for f in facts[:5]],
+                           "slide_type": "content_slide", "speaker_notes": "Highlight key facts"})
+
+        metrics = plan.get("key_metrics", [])
+        if metrics:
+            slides.append({"title": "Metrics & Figures", "content": [m[:60] for m in metrics[:5]],
+                           "slide_type": "content_slide", "speaker_notes": "Explain the numbers"})
+
+        if plan.get("key_dates"):
+            slides.append({"title": "Timeline", "content": plan["key_dates"][:5],
+                           "slide_type": "content_slide", "speaker_notes": "Walk through dates"})
+
+        faqs = self._derive_faqs(plan)
+        if faqs:
+            slides.append({"title": "FAQs", "content": faqs[:5], "slide_type": "content_slide",
+                           "speaker_notes": "Answer common questions"})
+
+        risks = self._derive_risks(plan)
+        if risks:
+            slides.append({"title": "Risks & Mitigations", "content": risks[:5], "slide_type": "content_slide",
+                           "speaker_notes": "Call out risks"})
+
+        slides.append({"title": "Next Steps",
+                       "content": ["Assign owners", "Set milestones", "Share deck", "Kickoff meeting"],
+                       "slide_type": "content_slide", "speaker_notes": "Action plan"})
+        return slides
+
+    def _derive_faqs(self, plan: Dict[str, Any]) -> List[str]:
+        faqs = []
+        for f in plan.get("key_facts", []):
+            if "?" in f and len(faqs) < 5:
+                faqs.append(f)
+        if len(faqs) < 3:
+            faqs.extend(["Who is the target audience?",
+                         "What is the expected outcome?",
+                         "What are the success metrics?"])
+        return faqs
+
+    def _derive_risks(self, plan: Dict[str, Any]) -> List[str]:
+        risks = []
+        text_blobs = " ".join([" ".join(sec.get("bullets", [])) for sec in plan.get("sections", [])])
+        if re.search(r"\brisks?\b|\bchallenge(s)?\b|\bissue(s)?\b", text_blobs, re.IGNORECASE):
+            risks.append("Scope creep without clear milestones")
+            risks.append("Missing data or unclear ownership")
+        risks.append("Timeline slippage due to dependencies")
+        risks.append("Stakeholder misalignment")
+        risks.append("Insufficient testing before launch")
+        return risks
+
+    # ========================== LLM CALLS (with rate limiting) ==========================
 
     def _call_llm_with_retry(self, provider: str, api_key: str, prompt: str, max_retries: int = 2) -> str:
         last_err = None
         for attempt in range(max_retries + 1):
             try:
-                if provider == "openai":
-                    return self._call_openai_enhanced(prompt, api_key)
-                if provider == "anthropic":
-                    return self._call_anthropic_enhanced(prompt, api_key)
+                retry_after = None
                 if provider == "google":
-                    return self._call_google_enhanced(prompt, api_key)
+                    rl.before_call("google")
+                elif provider == "anthropic":
+                    rl.before_call("anthropic")
+                elif provider == "openai":
+                    rl.before_call("openai")
+
+                if provider == "openai":
+                    return self._call_openai(prompt, api_key)
+                if provider == "anthropic":
+                    return self._call_anthropic(prompt, api_key)
+                if provider == "google":
+                    return self._call_gemini(prompt, api_key)
+
                 raise ValueError(f"Unsupported provider: {provider}")
             except Exception as e:
                 last_err = e
+                msg = str(e)
+                # server-provided retry hint like "retry_delay { seconds: 58 }"
+                m = re.search(r"retry[_ ]delay[^0-9]*([0-9]+)", msg, flags=re.IGNORECASE)
+                retry_after = int(m.group(1)) if m else None
+
                 if attempt < max_retries:
                     logger.warning(f"Attempt {attempt + 1} failed: {e}, retrying...")
+                    if provider in ("google", "openai", "anthropic"):
+                        rl.before_call(provider, retry_after=retry_after)
                 else:
                     break
         raise last_err or RuntimeError("LLM call failed")
 
-    def _call_openai_enhanced(self, prompt: str, api_key: str) -> str:
-        """OpenAI call tuned for JSON-only output. Uses your 'gpt-5' routing."""
+    def _call_openai(self, prompt: str, api_key: str) -> str:
+        openai.api_key = api_key
         try:
-            openai.api_key = api_key
             resp = openai.ChatCompletion.create(
                 model="gpt-5",
                 messages=[
-                    {"role": "system", "content": "You are a presentation expert. Output valid JSON only."},
+                    {"role": "system", "content": "Output valid JSON only. No markdown."},
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0.2,
+                temperature=0.15,
                 max_tokens=1800,
             )
             content = (resp.choices[0].message.content or "").strip()
@@ -242,16 +482,15 @@ CONTENT:
                 raise ValueError("Invalid OpenAI API key")
             if "rate" in msg or "quota" in msg or "limit" in msg:
                 raise ValueError("OpenAI rate limit exceeded")
-            raise ValueError(f"OpenAI error: {str(e)}")
+            raise
 
-    def _call_anthropic_enhanced(self, prompt: str, api_key: str) -> str:
-        """Anthropic (Claude Opus 4.1) with safe text-part concatenation."""
+    def _call_anthropic(self, prompt: str, api_key: str) -> str:
         try:
             client = anthropic.Anthropic(api_key=api_key)
             resp = client.messages.create(
                 model="claude-opus-4-1",
                 max_tokens=1800,
-                temperature=0.2,
+                temperature=0.15,
                 system="Return ONLY valid JSON (no markdown).",
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -259,9 +498,7 @@ CONTENT:
             for block in (resp.content or []):
                 if getattr(block, "type", "") == "text" and getattr(block, "text", ""):
                     parts.append(block.text)
-            text = ("\n".join(parts)).strip() if parts else ""
-            if not text and resp.content and getattr(resp.content[0], "text", None):
-                text = resp.content[0].text.strip()
+            text = ("\n".join(parts)).strip()
             if not text:
                 raise ValueError("Empty response from Claude")
             return text
@@ -269,60 +506,25 @@ CONTENT:
             raise ValueError("Invalid Anthropic API key")
         except anthropic.RateLimitError:
             raise ValueError("Anthropic rate limit exceeded")
-        except Exception as e:
-            raise ValueError(f"Anthropic error: {str(e)}")
+        except Exception:
+            raise
 
-    def _call_google_enhanced(self, prompt: str, api_key: str) -> str:
+    def _call_gemini(self, prompt: str, api_key: str) -> str:
         """
-        Gemini 2.5 Pro with JSON mode.
-        - Version-agnostic: If genai.types.Schema exists, use it; else fallback to MIME-only JSON mode.
-        - Always aggregate from candidates[].content.parts[] (never rely on response.text quick accessor).
-        - max_output_tokens set to 4000.
+        Gemini 2.5 Pro, JSON mime mode; avoid response.text; collect parts.
         """
         try:
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel("gemini-2.5-pro")
-
-            # Try to build a schema if this SDK version supports it
-            response_schema = None
-            try:
-                if hasattr(genai, "types") and hasattr(genai.types, "Schema") and hasattr(genai.types, "Type"):
-                    Schema, Type = genai.types.Schema, genai.types.Type
-                    response_schema = Schema(
-                        type=Type.OBJECT,
-                        properties={
-                            "presentation_title": Schema(type=Type.STRING),
-                            "slides": Schema(
-                                type=Type.ARRAY,
-                                items=Schema(
-                                    type=Type.OBJECT,
-                                    properties={
-                                        "title": Schema(type=Type.STRING),
-                                        "content": Schema(type=Type.ARRAY, items=Schema(type=Type.STRING)),
-                                        "slide_type": Schema(type=Type.STRING),
-                                        "speaker_notes": Schema(type=Type.STRING),
-                                    },
-                                    required=["title", "content", "slide_type"],
-                                ),
-                            ),
-                        },
-                        required=["slides"],
-                    )
-            except Exception:
-                response_schema = None  # fall back if building schema fails
-
             gen_cfg = {
-                "temperature": 0.15,
-                "max_output_tokens": 4000,   # as requested
+                "temperature": 0.1,
+                "max_output_tokens": 4000,   # per your request
                 "candidate_count": 1,
                 "response_mime_type": "application/json",
+                "top_p": 0.8,
+                "top_k": 40,
             }
-            if response_schema is not None:
-                gen_cfg["response_schema"] = response_schema
-
             resp = model.generate_content(prompt, generation_config=gen_cfg)
-
-            # Aggregate JSON from parts
             texts = []
             for cand in getattr(resp, "candidates", []) or []:
                 content = getattr(cand, "content", None)
@@ -330,49 +532,107 @@ CONTENT:
                     t = getattr(part, "text", None)
                     if t:
                         texts.append(t)
-
-            # Do NOT call resp.text quick accessor (can raise when parts empty)
             out = ("\n".join(texts)).strip()
             if not out:
                 raise ValueError("Empty response from Google")
             return out
-
         except Exception as e:
             msg = str(e)
             if "api key" in msg.lower():
                 raise ValueError("Invalid Google API key")
+            if "429" in msg or "rate limit" in msg.lower() or "quota" in msg.lower():
+                raise ValueError("Google rate limit exceeded")
             if "500" in msg:
                 raise ValueError("Google error: transient server issue (500). Please retry.")
-            if "has no attribute 'Schema'" in msg:
-                # We already fell back to MIME mode; surface a cleaner hint
-                raise ValueError("Google error: SDK lacks JSON schema helpers; JSON mode fallback used.")
-            raise ValueError(f"Google error: {msg}")
+            raise
 
-    # ------------------------------ Parsing & Validation ------------------------------
+    # ======= Sectional generation (same provider only) =======
+
+    def _sectional_generate(self, provider: str, api_key: str, plan: Dict[str, Any], target_slides: int) -> List[Dict]:
+        # Auto-size sectional calls to fit provider RPM in a single minute:
+        # calls ≈ 1 primary + N sectionals + 1 refine  →  N ≤ RPM - 2
+        if provider == "google":
+            rpm = rl.rpm.get("google", 5)
+            dynamic_cap = max(1, min(self.section_call_cap, max(0, rpm - 2)))
+            cap = dynamic_cap
+        else:
+            cap = self.section_call_cap
+
+        sections = plan.get("sections", [])[:cap]
+        slides: List[Dict] = []
+        topic = plan.get("topic") or "Presentation"
+
+        slides.append({
+            "title": topic,
+            "content": [f"Overview of {topic}", "Key takeaways", "Agenda"],
+            "slide_type": "title_slide",
+            "speaker_notes": f"Introduce {topic}"
+        })
+
+        per_section = max(1, min(2, target_slides // max(1, len(sections))))
+
+        for sec in sections:
+            sec_prompt = f"""
+Build JSON slides ONLY for the SECTION, grounded strictly in its bullets.
+No markdown, no prose. JSON only.
+
+OUTPUT: {per_section} content slide(s), each with 3–5 bullets (<15 words).
+SECTION:
+{json.dumps(sec, ensure_ascii=False)[:2500]}
+
+JSON FORMAT:
+{{"slides":[{{"title":"...","content":["..."],"slide_type":"content_slide","speaker_notes":"short"}}]}}
+""".strip()
+            try:
+                if provider == "google":
+                    rl.before_call("google")
+                elif provider == "anthropic":
+                    rl.before_call("anthropic")
+                elif provider == "openai":
+                    rl.before_call("openai")
+
+                if provider == "openai":
+                    out = self._call_openai(sec_prompt, api_key)
+                elif provider == "anthropic":
+                    out = self._call_anthropic(sec_prompt, api_key)
+                else:
+                    out = self._call_gemini(sec_prompt, api_key)
+
+                sec_slides = self._robust_json_extraction(out)
+                for ss in sec_slides:
+                    if ss.get("slide_type") == "title_slide":
+                        ss["slide_type"] = "content_slide"
+                slides.extend(sec_slides)
+                if len(slides) >= self.max_slides - 1:
+                    break
+            except Exception as e:
+                logger.warning(f"Sectional gen error: {e}; continuing.")
+                if "rate limit" in str(e).lower() or "quota" in str(e).lower():
+                    break  # stop on quota to avoid thrash
+
+        slides.append({
+            "title": "Conclusion & Next Steps",
+            "content": ["Summary of key points", "Actionable next steps", "Q&A"],
+            "slide_type": "conclusion_slide",
+            "speaker_notes": "Wrap up"
+        })
+        return slides
+
+    # ========================== JSON EXTRACTION & VALIDATION ==========================
 
     def _robust_json_extraction(self, response: str) -> List[Dict]:
-        """
-        Parse JSON from LLM output:
-        - strips code fences if present,
-        - extracts outermost JSON containing "slides",
-        - validates & normalizes; otherwise falls back to markdown parsing.
-        """
         cleaned = (response or "").strip()
-
-        # Strip triple-backtick fences
         if cleaned.startswith("```"):
             cleaned = cleaned.strip("`").strip()
             if cleaned.lower().startswith("json"):
                 cleaned = cleaned[4:].strip()
 
-        # Extract outer JSON containing "slides"
         match = re.search(r"\{.*\"slides\".*\}[\s\S]*$", cleaned)
         candidate = match.group(0) if match else cleaned
 
         try:
             data = json.loads(candidate)
         except Exception:
-            # Try extracting just the slides array
             arr = re.search(r"\"slides\"\s*:\s*(\[[\s\S]*?\])", cleaned)
             if arr:
                 try:
@@ -380,19 +640,14 @@ CONTENT:
                     return self._validate_and_enhance_slides(slides)
                 except Exception:
                     pass
-            # Markdown/prose fallback
             return self._md_to_slides(cleaned)
 
-        if not self._validate_json_structure(data):
+        if not (isinstance(data, dict) and isinstance(data.get("slides"), list) and data["slides"]):
             return self._md_to_slides(cleaned)
 
         return self._validate_and_enhance_slides(data)
 
-    def _validate_json_structure(self, data: Dict) -> bool:
-        return isinstance(data, dict) and isinstance(data.get("slides"), list) and len(data["slides"]) > 0
-
     def _validate_and_enhance_slides(self, data_or_slides) -> List[Dict]:
-        """Normalize to guaranteed non-empty, 3–5 concise bullets per slide."""
         slides = data_or_slides if isinstance(data_or_slides, list) else data_or_slides.get("slides", [])
         out: List[Dict] = []
 
@@ -406,7 +661,6 @@ CONTENT:
                 content = [content]
             content = [self._clean_text(str(x))[:150] for x in content if str(x).strip()]
 
-            # Guarantee 3–5 bullets where possible
             if len(content) < 3 and i > 0:
                 content += [f"Key insight about {title.lower()}"]
             content = [c for c in content if c][:5]
@@ -418,203 +672,95 @@ CONTENT:
             if i == 0:
                 stype = "title_slide"
 
-            out.append(
-                {"title": title, "content": content, "slide_type": stype, "speaker_notes": notes}
-            )
+            out.append({"title": title, "content": content, "slide_type": stype, "speaker_notes": notes})
 
-        # enforce max slides
         return out[: self.max_slides]
 
     def _md_to_slides(self, text: str) -> List[Dict]:
-        """
-        Markdown/prose → slides:
-        - # H1 → title slide
-        - ##/### → section slides
-        - Bullets/numbered → bullets
-        - Guarantees 3–5 bullets where viable
-        """
         lines = (text or "").splitlines()
         slides: List[Dict] = []
         cur: Optional[Dict] = None
 
-        def push_slide():
+        def push():
             nonlocal cur
             if not cur:
                 return
             bullets = [re.sub(r"\s+", " ", b).strip() for b in cur.get("content", []) if b.strip()]
-            bullets = [b[:150] for b in bullets]
-            if not bullets and cur.get("title"):
-                bullets = [f"Overview of {cur['title']}"]
-            # make 3–5 bullets when possible
+            bullets = [b[:150] for b in bullets] or [f"Overview of {cur['title']}"]
             if len(bullets) < 3:
-                bullets = bullets + [" "] * (3 - len(bullets))
+                bullets += [" "] * (3 - len(bullets))
             cur["content"] = bullets[:5]
             slides.append(cur)
             cur = None
 
         for raw in lines:
-            line = raw.strip()
-            if not line:
+            ln = raw.strip()
+            if not ln:
                 continue
-            if line.startswith("# "):
+            if ln.startswith("# "):
                 if cur:
-                    push_slide()
-                t = line[2:].strip() or "Presentation"
+                    push()
+                t = ln[2:].strip() or "Presentation"
                 cur = {"title": t, "content": [], "slide_type": "title_slide", "speaker_notes": f"Intro: {t}"}
-            elif line.startswith("## ") or line.startswith("### "):
+            elif ln.startswith("## ") or ln.startswith("### "):
                 if cur:
-                    push_slide()
-                t = line.split(" ", 1)[1].strip() or "Section"
+                    push()
+                t = ln.split(" ", 1)[1].strip() or "Section"
                 cur = {"title": t, "content": [], "slide_type": "content_slide", "speaker_notes": f"Discuss: {t}"}
-            elif re.match(r"^(\*|-|•|\d+\.)\s+", line):
+            elif re.match(r"^(\*|-|•|\d+\.)\s+", ln):
                 if not cur:
                     cur = {"title": "Key Points", "content": [], "slide_type": "content_slide", "speaker_notes": "Key points"}
-                b = re.sub(r"^(\*|-|•|\d+\.)\s+", "", line).strip()
+                b = re.sub(r"^(\*|-|•|\d+\.)\s+", "", ln).strip()
                 if b:
                     cur["content"].append(b)
             else:
                 if not cur:
                     cur = {"title": "Overview", "content": [], "slide_type": "content_slide", "speaker_notes": "Overview"}
-                if len(line) > 40:
-                    cur["content"].append(line)
+                if len(ln) > 40:
+                    cur["content"].append(ln)
 
         if cur:
-            push_slide()
+            push()
 
         if not slides:
             return self._create_default_slides(text)
-
-        # ensure ending conclusion if not present
         if not any(s.get("slide_type") == "conclusion_slide" for s in slides[-2:]):
-            slides.append(
-                {
-                    "title": "Conclusion & Next Steps",
-                    "content": ["Summary of key points", "Actionable next steps", "Q&A"],
-                    "slide_type": "conclusion_slide",
-                    "speaker_notes": "Wrap up",
-                }
-            )
+            slides.append({
+                "title": "Conclusion & Next Steps",
+                "content": ["Summary of key points", "Actionable next steps", "Q&A"],
+                "slide_type": "conclusion_slide",
+                "speaker_notes": "Wrap up",
+            })
         return slides
 
-    # ------------------------------ Utilities & Fallbacks ------------------------------
-
-    def _score_slides(self, slides: List[Dict]) -> float:
-        """Simple heuristic: average bullets per non-title slide; penalize empties."""
-        if not slides:
-            return 0.0
-        counts, n = 0, 0
-        for i, s in enumerate(slides):
-            if s.get("slide_type") == "title_slide" or i == 0:
-                continue
-            b = [x for x in (s.get("content") or []) if x and x.strip()]
-            counts += len(b)
-            n += 1
-        return (counts / max(n, 1)) if n else 0.0
-
-    def _refine_with_provider(self, provider: str, api_key: str, prior_json: str, target_slides: int) -> str:
-        """Ask the same provider to densify bullets and increase slide count if light."""
-        refine_prompt = f"""
-You previously returned this JSON presentation:
-
-{prior_json}
-
-Improve it:
-- Keep JSON only (no markdown).
-- Ensure 1 title slide, >= {max(4, target_slides)} total slides, and a clear conclusion.
-- For each content slide, include 3–5 action-oriented bullets (<15 words each).
-- Prefer concrete, specific bullets over generic statements.
-Return ONLY the JSON object.
-""".strip()
-        if provider == "openai":
-            return self._call_openai_enhanced(refine_prompt, api_key)
-        if provider == "anthropic":
-            return self._call_anthropic_enhanced(refine_prompt, api_key)
-        if provider == "google":
-            return self._call_google_enhanced(refine_prompt, api_key)
-        raise ValueError(f"Unsupported provider for refine: {provider}")
+    # ========================== CLEANING & DEFAULTS ==========================
 
     def _clean_text(self, text: str) -> str:
         if not text:
             return ""
-        # Normalize Windows CRLF artifacts that sometimes leak from copied text/HTML
         text = text.replace("_x000D_", " ").replace("\r\n", " ").replace("\r", " ")
         cleaned = re.sub(r"\s+", " ", text.strip())
-        # Keep common punctuation; strip control chars/odd glyphs
         cleaned = re.sub(r"[^\w\s\-.,!?()&%$#@:/]", "", cleaned)
         return cleaned
 
     def _create_default_slides(self, original_text: str) -> List[Dict]:
         words = (original_text or "").split()
-        chunk_size = max(50, len(words) // 4 or 50)
-        chunks = [" ".join(words[i: i + chunk_size]) for i in range(0, len(words), chunk_size)]
+        chunk = " ".join(words[:250])
         slides = [
-            {
-                "title": "Presentation Overview",
-                "content": ["Key insights from your content", "Structured information", "Professional presentation"],
-                "slide_type": "title_slide",
-                "speaker_notes": "Introduction to the presentation content",
-            }
+            {"title": "Presentation Overview",
+             "content": ["Key insights from your content", "Structured information", "Professional presentation"],
+             "slide_type": "title_slide", "speaker_notes": "Intro"}
         ]
-        for i, chunk in enumerate(chunks[:6]):
-            sentences = re.split(r"[.!?]+", chunk)
-            bullets = [s.strip() for s in sentences if len(s.strip()) > 20][:4]
-            if bullets:
-                slides.append(
-                    {
-                        "title": f"Key Point {i+1}",
-                        "content": bullets,
-                        "slide_type": "content_slide",
-                        "speaker_notes": f"Detailed discussion of key point {i+1}",
-                    }
-                )
-        slides.append(
-            {
-                "title": "Conclusion & Next Steps",
-                "content": ["Summary of key points", "Actionable next steps", "Q&A"],
-                "slide_type": "conclusion_slide",
-                "speaker_notes": "Wrap up",
-            }
-        )
+        sentences = re.split(r"[.!?]+", chunk)
+        bullets = [s.strip() for s in sentences if len(s.strip()) > 20][:4]
+        if bullets:
+            slides.append({"title": "Key Points", "content": bullets, "slide_type": "content_slide", "speaker_notes": "Explain"})
+        slides.append({"title": "Conclusion & Next Steps", "content": ["Summary", "Next steps", "Q&A"], "slide_type": "conclusion_slide", "speaker_notes": "Wrap up"})
         return slides
 
-    def _emergency_fallback_parsing(self, text: str) -> List[Dict]:
-        """Simple paragraph-based split as last resort."""
-        paragraphs = [p.strip() for p in (text or "").split("\n\n") if p.strip()]
-        slides = [
-            {
-                "title": "Generated Presentation",
-                "content": ["Content extracted from your text", "Organized professionally", "Ready for presentation"],
-                "slide_type": "title_slide",
-                "speaker_notes": "Opening slide introducing the presentation",
-            }
-        ]
-        for i, para in enumerate(paragraphs[:8]):
-            sentences = [s.strip() for s in re.split(r"[.!?]+", para) if len(s.strip()) > 10]
-            if sentences:
-                title = sentences[0][:50] + ("..." if len(sentences[0]) > 50 else "")
-                content = sentences[1:5] if len(sentences) > 1 else [sentences[0]]
-                slides.append(
-                    {
-                        "title": title,
-                        "content": content,
-                        "slide_type": "content_slide",
-                        "speaker_notes": f"Discussion of paragraph {i+1} content",
-                    }
-                )
-        slides.append(
-            {
-                "title": "Conclusion & Next Steps",
-                "content": ["Summary of key points", "Actionable next steps", "Q&A"],
-                "slide_type": "conclusion_slide",
-                "speaker_notes": "Wrap up",
-            }
-        )
-        return slides
-
-    # ------------------------------ Layout Controls (keep text inside slide) ------------------------------
+    # ========================== LAYOUT / RENDERING ==========================
 
     def _split_long_bullets(self, slides: List[Dict], max_len: int = 140) -> List[Dict]:
-        """Split very long bullets into two at natural breakpoints to avoid overflow."""
         out = []
         for s in slides:
             bullets = []
@@ -623,14 +769,13 @@ Return ONLY the JSON object.
                 if len(t) <= max_len:
                     bullets.append(t)
                 else:
-                    # split at punctuation/comma/semicolon/ dash
                     split_pt = max(
                         t.rfind(". ", 0, max_len),
                         t.rfind("; ", 0, max_len),
                         t.rfind(", ", 0, max_len),
                         t.rfind(" - ", 0, max_len),
                     )
-                    if split_pt < 60:  # if no good breakpoint, hard split
+                    if split_pt < 60:
                         split_pt = max_len
                     bullets.append(t[:split_pt].strip())
                     rest = t[split_pt:].lstrip(".;,- ").strip()
@@ -642,51 +787,32 @@ Return ONLY the JSON object.
         return out
 
     def _paginate_content(self, slides: List[Dict]) -> List[Dict]:
-        """
-        Split slides whose total character load is too high into continuation slides.
-        Heuristic thresholds; avoids overflow on small placeholders in some templates.
-        """
         paginated: List[Dict] = []
-        per_slide_char_limit = 600  # rough capacity for 18–20pt with bullets
+        limit = 600  # rough capacity for 18–20pt with bullets
         for s in slides:
             bullets = s.get("content") or []
-            total_len = sum(len(b or "") for b in bullets)
-            if total_len <= per_slide_char_limit or s.get("slide_type") == "title_slide":
+            total = sum(len(b or "") for b in bullets)
+            if total <= limit or s.get("slide_type") == "title_slide":
                 paginated.append(s)
                 continue
-
-            # Split into chunks by cumulative length
-            chunk: List[str] = []
-            chunk_len = 0
-            chunk_idx = 1
+            chunk, clen, idx = [], 0, 1
             for b in bullets:
-                blen = len(b or "")
-                if chunk and (chunk_len + blen) > per_slide_char_limit:
-                    paginated.append({
-                        "title": f"{s.get('title','Slide')} (cont. {chunk_idx})",
-                        "content": chunk[:5],
-                        "slide_type": "content_slide",
-                        "speaker_notes": s.get("speaker_notes","")
-                    })
-                    chunk = []
-                    chunk_len = 0
-                    chunk_idx += 1
-                chunk.append(b)
-                chunk_len += blen
-
+                bl = len(b or "")
+                if chunk and (clen + bl) > limit:
+                    paginated.append({"title": f"{s.get('title','Slide')} (cont. {idx})",
+                                      "content": chunk[:5], "slide_type": "content_slide",
+                                      "speaker_notes": s.get("speaker_notes","")})
+                    chunk, clen, idx = [], 0, idx + 1
+                chunk.append(b); clen += bl
             if chunk:
-                suffix = "" if chunk_idx == 1 else f" (cont. {chunk_idx})"
-                paginated.append({
-                    "title": f"{s.get('title','Slide')}{suffix}",
-                    "content": chunk[:5],
-                    "slide_type": "content_slide",
-                    "speaker_notes": s.get("speaker_notes","")
-                })
+                suf = "" if idx == 1 else f" (cont. {idx})"
+                paginated.append({"title": f"{s.get('title','Slide')}{suf}",
+                                  "content": chunk[:5], "slide_type": "content_slide",
+                                  "speaker_notes": s.get("speaker_notes","")})
         return paginated
 
     def _safe_rect(self, prs: Presentation) -> Tuple[Emu, Emu, Emu, Emu]:
-        """Return a safe content rectangle (left, top, width, height) with margins, using prs dims."""
-        sw, sh = prs.slide_width, prs.slide_height  # EMU
+        sw, sh = prs.slide_width, prs.slide_height
         margin_x = Emu(Inches(0.8))
         top = Emu(Inches(1.6))
         bottom = Emu(Inches(0.8))
@@ -695,37 +821,21 @@ Return ONLY the JSON object.
         height = sh - top - bottom
         return left, top, width, height
 
-    def _apply_textframe_presentation_defaults(self, tf, base_pt=20):
-        """Word-wrap, auto-size to fit, margins, and adaptive font size."""
-        try:
-            tf.word_wrap = True
-        except Exception:
-            pass
-        try:
-            tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
-        except Exception:
-            pass
-        # margins (EMU)
+    def _apply_textframe_defaults(self, tf, base_pt=20):
+        try: tf.word_wrap = True
+        except: pass
+        try: tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+        except: pass
         try:
             tf.margin_left = Emu(Inches(0.1))
             tf.margin_right = Emu(Inches(0.1))
             tf.margin_top = Emu(Inches(0.05))
             tf.margin_bottom = Emu(Inches(0.05))
-        except Exception:
-            pass
-
-        # Adaptive font size baseline
+        except: pass
         size = base_pt
         joined = " ".join(p.text for p in tf.paragraphs if getattr(p, "text", ""))
-        length = len(joined)
-        if length > 500:
-            size = 16
-        elif length > 350:
-            size = 18
-        else:
-            size = base_pt
-
-        # Apply size + style to first paragraph; others set in add loop
+        L = len(joined)
+        size = 16 if L > 500 else (18 if L > 350 else base_pt)
         try:
             p0 = tf.paragraphs[0]
             p0.font.size = Pt(size)
@@ -733,69 +843,45 @@ Return ONLY the JSON object.
             if ctx.get("body_font"):
                 p0.font.name = ctx["body_font"]
             p0.font.color.rgb = (ctx.get("body_color", RGBColor(64, 64, 64)))
-        except Exception:
-            pass
-
+        except: pass
         return size
 
     def _ideal_bullet_font_size(self, bullets: List[str]) -> int:
         n = len(bullets or [])
-        avg_len = sum(len(b or "") for b in bullets) / max(n, 1)
+        avg = sum(len(b or "") for b in bullets) / max(n, 1)
         size = 20
-        if n >= 5 or avg_len > 90:
-            size = 18
-        if n >= 6 or avg_len > 120:
-            size = 16
+        if n >= 5 or avg > 90: size = 18
+        if n >= 6 or avg > 120: size = 16
         return size
 
     def _place_logo_safe(self, prs: Presentation, slide, img_path: str, is_title: bool):
-        """Place a small logo inside bounds at top-right (title) / bottom-right (others)."""
         sw, sh = prs.slide_width, prs.slide_height
-        desired_h_in = 0.9 if is_title else 1.0
-        pic = slide.shapes.add_picture(img_path, Emu(0), Emu(0), height=Emu(Inches(desired_h_in)))
-        # place with margin
+        h_in = 0.9 if is_title else 1.0
+        pic = slide.shapes.add_picture(img_path, Emu(0), Emu(0), height=Emu(Inches(h_in)))
         margin = Emu(Inches(0.3 if is_title else 0.4))
         pic.left = sw - margin - pic.width
         pic.top = (Emu(Inches(0.3)) if is_title else (sh - margin - pic.height))
 
-    # ------------------------------ Template Style/Assets ------------------------------
-
     def _extract_style_and_assets(self, prs: Presentation) -> dict:
-        """
-        Heuristically extract title/body font names, primary colors, and picture assets
-        from the uploaded PPTX/POTX (without removing its slides).
-        """
         style = {
-            "title_font": None,
-            "body_font": None,
-            "title_color": RGBColor(31, 73, 125),  # default pro blue
-            "body_color": RGBColor(64, 64, 64),
-            "images": [],  # list of temp file paths
+            "title_font": None, "body_font": None,
+            "title_color": RGBColor(31, 73, 125), "body_color": RGBColor(64, 64, 64),
+            "images": [],
         }
-
-        # Try reading first slide placeholders for font/color
         try:
             if len(prs.slides):
                 s0 = prs.slides[0]
                 if getattr(s0.shapes, "title", None) and s0.shapes.title.has_text_frame:
                     p = s0.shapes.title.text_frame.paragraphs[0].font
-                    if getattr(p, "name", None):
-                        style["title_font"] = p.name
-                    if getattr(p.color, "rgb", None):
-                        style["title_color"] = p.color.rgb
-                # find any text placeholder for body font
-                for shp in s0.placeholders:
-                    if hasattr(shp, "text_frame") and shp is not getattr(s0.shapes, "title", None):
-                        pf = shp.text_frame.paragraphs[0].font
-                        if getattr(pf, "name", None):
-                            style["body_font"] = style["body_font"] or pf.name
-                        if getattr(pf.color, "rgb", None):
-                            style["body_color"] = pf.color.rgb
+                    if getattr(p, "name", None): style["title_font"] = p.name
+                    if getattr(p.color, "rgb", None): style["title_color"] = p.color.rgb
+                for ph in s0.placeholders:
+                    if hasattr(ph, "text_frame") and ph is not getattr(s0.shapes, "title", None):
+                        pf = ph.text_frame.paragraphs[0].font
+                        if getattr(pf, "name", None): style["body_font"] = style["body_font"] or pf.name
+                        if getattr(pf.color, "rgb", None): style["body_color"] = pf.color.rgb
                         break
-        except Exception:
-            pass
-
-        # Harvest picture assets (from all existing slides)
+        except: pass
         try:
             for s in prs.slides:
                 for shp in s.shapes:
@@ -804,195 +890,141 @@ Return ONLY the JSON object.
                             blob = shp.image.blob
                             ext = shp.image.ext or "png"
                             tf = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}")
-                            tf.write(blob)
-                            tf.flush(); tf.close()
+                            tf.write(blob); tf.flush(); tf.close()
                             style["images"].append(tf.name)
-                        except Exception:
-                            continue
-        except Exception:
-            pass
-
+                        except: continue
+        except: pass
         return style
 
-    # ------------------------------ PPT Creation Helpers ------------------------------
-
-    def _create_enhanced_slide(self, prs: Presentation, slide_data: Dict, index: int):
-        # Choose layout
-        if slide_data.get("slide_type") == "title_slide" and index == 0:
+    def _create_enhanced_slide(self, prs: Presentation, s: Dict, idx: int):
+        if s.get("slide_type") == "title_slide" and idx == 0:
             layout_idx = 0 if len(prs.slide_layouts) > 0 else 1
-        elif slide_data.get("content"):
+        elif s.get("content"):
             layout_idx = 1 if len(prs.slide_layouts) > 1 else 0
         else:
             layout_idx = 5 if len(prs.slide_layouts) > 5 else 1
-
-        try:
-            slide_layout = prs.slide_layouts[layout_idx]
-        except Exception:
-            slide_layout = prs.slide_layouts[0]
-
-        slide = prs.slides.add_slide(slide_layout)
+        try: lay = prs.slide_layouts[layout_idx]
+        except: lay = prs.slide_layouts[0]
+        slide = prs.slides.add_slide(lay)
 
         # Title
         try:
-            title_text = slide_data["title"]
+            title_text = s["title"]
             if getattr(slide.shapes, "title", None):
                 slide.shapes.title.text = title_text
-                self._style_title(slide.shapes.title, index == 0)
+                self._style_title(slide.shapes.title, idx == 0)
             else:
-                # Safe title box near top, within margins
                 sw = prs.slide_width
-                left = Emu(Inches(0.8))
-                top = Emu(Inches(0.5))
-                width = sw - left - Emu(Inches(0.8))
-                height = Emu(Inches(1.2))
+                left = Emu(Inches(0.8)); top = Emu(Inches(0.5))
+                width = sw - left - Emu(Inches(0.8)); height = Emu(Inches(1.2))
                 tb = slide.shapes.add_textbox(left, top, width, height)
-                tf = tb.text_frame
-                tf.clear()
-                p = tf.paragraphs[0]
-                p.text = title_text
-                p.font.bold = True
-                p.font.size = Pt(36 if index == 0 else 30)
+                tf = tb.text_frame; tf.clear()
+                p = tf.paragraphs[0]; p.text = title_text
+                p.font.bold = True; p.font.size = Pt(36 if idx == 0 else 30)
                 ctx = getattr(self, "_style_ctx", None) or {}
-                if ctx.get("title_font"):
-                    p.font.name = ctx["title_font"]
-                try:
-                    p.font.color.rgb = ctx.get("title_color", RGBColor(31, 73, 125))
-                except Exception:
-                    pass
+                if ctx.get("title_font"): p.font.name = ctx["title_font"]
+                try: p.font.color.rgb = ctx.get("title_color", RGBColor(31, 73, 125))
+                except: pass
         except Exception as e:
             logger.debug(f"Title add failed: {e}")
 
         # Content
         try:
-            bullets = slide_data.get("content") or []
+            bullets = s.get("content") or []
             if bullets:
-                # Try a content placeholder
                 ph = None
                 for ph_i in getattr(slide, "placeholders", []):
                     if hasattr(ph_i, "text_frame") and ph_i != getattr(slide.shapes, "title", None):
-                        ph = ph_i
-                        break
-
+                        ph = ph_i; break
                 use_ph = False
                 if ph and hasattr(ph, "height") and hasattr(ph, "width"):
-                    # If placeholder visibly large, use it; else create our own box
                     try:
-                        if ph.height >= Emu(Inches(2.0)) and ph.width >= Emu(Inches(5.0)):
-                            use_ph = True
+                        use_ph = (ph.height >= Emu(Inches(2.0)) and ph.width >= Emu(Inches(5.0)))
                     except Exception:
                         use_ph = True
-
                 if use_ph:
-                    tf = ph.text_frame
-                    tf.clear()
-                    base_size = self._ideal_bullet_font_size(bullets)
-                    self._apply_textframe_presentation_defaults(tf, base_pt=base_size)
-                    for i, bullet_text in enumerate(bullets):
+                    tf = ph.text_frame; tf.clear()
+                    base = self._ideal_bullet_font_size(bullets)
+                    self._apply_textframe_defaults(tf, base_pt=base)
+                    for i, t in enumerate(bullets):
                         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-                        p.text = bullet_text
-                        p.level = 0
+                        p.text = t; p.level = 0
                         try:
-                            p.font.size = Pt(base_size)
-                            p.space_after = Pt(6)
+                            p.font.size = Pt(base); p.space_after = Pt(6)
                             ctx = getattr(self, "_style_ctx", None) or {}
-                            if ctx.get("body_font"):
-                                p.font.name = ctx["body_font"]
+                            if ctx.get("body_font"): p.font.name = ctx["body_font"]
                             p.font.color.rgb = ctx.get("body_color", RGBColor(64, 64, 64))
-                        except Exception:
-                            pass
+                        except: pass
                 else:
-                    # Safe textbox within margins (use presentation dims)
                     left, top, width, height = self._safe_rect(prs)
                     tb = slide.shapes.add_textbox(left, top, width, height)
-                    tf = tb.text_frame
-                    tf.clear()
-                    base_size = self._ideal_bullet_font_size(bullets)
-                    self._apply_textframe_presentation_defaults(tf, base_pt=base_size)
-                    for i, bullet_text in enumerate(bullets):
+                    tf = tb.text_frame; tf.clear()
+                    base = self._ideal_bullet_font_size(bullets)
+                    self._apply_textframe_defaults(tf, base_pt=base)
+                    for i, t in enumerate(bullets):
                         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-                        p.text = f"{bullet_text}"
-                        p.level = 0
+                        p.text = t; p.level = 0
                         try:
-                            p.font.size = Pt(base_size)
-                            p.space_after = Pt(6)
+                            p.font.size = Pt(base); p.space_after = Pt(6)
                             ctx = getattr(self, "_style_ctx", None) or {}
-                            if ctx.get("body_font"):
-                                p.font.name = ctx["body_font"]
+                            if ctx.get("body_font"): p.font.name = ctx["body_font"]
                             p.font.color.rgb = ctx.get("body_color", RGBColor(64, 64, 64))
-                        except Exception:
-                            pass
+                        except: pass
         except Exception as e:
             logger.warning(f"Could not add content: {e}")
-            self._add_basic_content(prs, slide, slide_data.get("content", []))
+            self._add_basic_content(prs, slide, s.get("content", []))
 
         # Speaker notes
-        self._add_speaker_notes(slide, slide_data.get("speaker_notes", ""))
+        self._add_speaker_notes(slide, s.get("speaker_notes", ""))
 
-    def _style_title(self, title_shape, is_main_title: bool):
+    def _style_title(self, title_shape, is_main: bool):
         try:
             if title_shape.text_frame:
-                paragraph = title_shape.text_frame.paragraphs[0]
-                font = paragraph.font
-                font.size = Pt(36 if is_main_title else 30)
-                font.bold = True
+                p = title_shape.text_frame.paragraphs[0]; f = p.font
+                f.size = Pt(36 if is_main else 30); f.bold = True
                 ctx = getattr(self, "_style_ctx", None) or {}
-                if ctx.get("title_font"):
-                    font.name = ctx["title_font"]
-                try:
-                    font.color.rgb = ctx.get("title_color", RGBColor(31, 73, 125))
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.debug(f"Title styling failed: {e}")
+                if ctx.get("title_font"): f.name = ctx["title_font"]
+                try: f.color.rgb = ctx.get("title_color", RGBColor(31, 73, 125))
+                except: pass
+        except: pass
 
     def _add_basic_content(self, prs: Presentation, slide, content_list: List[str]):
         try:
             left, top, width, height = self._safe_rect(prs)
-            textbox = slide.shapes.add_textbox(left, top, width, height)
-            tf = textbox.text_frame
-            tf.clear()
-            base_size = self._ideal_bullet_font_size(content_list)
-            self._apply_textframe_presentation_defaults(tf, base_pt=base_size)
-            for i, bullet_text in enumerate(content_list):
+            tb = slide.shapes.add_textbox(left, top, width, height)
+            tf = tb.text_frame; tf.clear()
+            base = self._ideal_bullet_font_size(content_list)
+            self._apply_textframe_defaults(tf, base_pt=base)
+            for i, t in enumerate(content_list):
                 p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-                p.text = f"{bullet_text}"
+                p.text = t
                 try:
-                    p.font.size = Pt(base_size)
+                    p.font.size = Pt(base)
                     ctx = getattr(self, "_style_ctx", None) or {}
-                    if ctx.get("body_font"):
-                        p.font.name = ctx["body_font"]
+                    if ctx.get("body_font"): p.font.name = ctx["body_font"]
                     p.font.color.rgb = ctx.get("body_color", RGBColor(64, 64, 64))
-                except Exception:
-                    pass
+                except: pass
         except Exception as e:
             logger.warning(f"Basic content addition failed: {e}")
 
     def _add_speaker_notes(self, slide, notes: str):
-        if not notes:
-            return
+        if not notes: return
         try:
-            notes_slide = slide.notes_slide  # create if missing
-            text_frame = notes_slide.notes_text_frame
-            text_frame.text = notes
-        except Exception as e:
-            logger.debug(f"Could not add speaker notes: {e}")
+            ns = slide.notes_slide
+            ns.notes_text_frame.text = notes
+        except: pass
 
-    def _create_fallback_slide(self, prs: Presentation, slide_data: Dict, index: int):
+    def _create_fallback_slide(self, prs: Presentation, s: Dict, idx: int):
         try:
-            slide_layout = prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[0]
-            slide = prs.slides.add_slide(slide_layout)
-            # Title (use prs dims)
+            lay = prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[0]
+            slide = prs.slides.add_slide(lay)
             sw = prs.slide_width
-            left = Emu(Inches(0.8))
-            top = Emu(Inches(0.5))
+            left = Emu(Inches(0.8)); top = Emu(Inches(0.5))
             width = sw - left - Emu(Inches(0.8))
-            title_box = slide.shapes.add_textbox(left, top, width, Emu(Inches(1.2)))
-            tf = title_box.text_frame
-            tf.text = slide_data.get("title", f"Slide {index+1}")
-            tf.paragraphs[0].font.size = Pt(32)
-            tf.paragraphs[0].font.bold = True
-            # Content
-            self._add_basic_content(prs, slide, slide_data.get("content") or [])
+            tb = slide.shapes.add_textbox(left, top, width, Emu(Inches(1.2)))
+            tf = tb.text_frame; tf.text = s.get("title", f"Slide {idx+1}")
+            tf.paragraphs[0].font.size = Pt(32); tf.paragraphs[0].font.bold = True
+            self._add_basic_content(prs, slide, s.get("content") or [])
         except Exception as e:
             logger.error(f"Even fallback slide creation failed: {e}")
 
@@ -1009,8 +1041,7 @@ ppt_generator = PPTGenerator()
 @app.route("/")
 def index():
     try:
-        # Keep index.html unchanged (must be served via templates/index.html)
-        return render_template("index.html")
+        return render_template("index.html")  # unchanged
     except Exception:
         return "<h1>Auto PPT Generator</h1><p>Server running but template missing.</p>", 200
 
@@ -1033,13 +1064,12 @@ def generate_presentation():
         if provider not in ppt_generator.supported_providers:
             return jsonify({"error": f"Unsupported provider: {provider}"}), 400
 
-        # Handle optional template file
         template_path = None
         if "template_file" in request.files:
-            template_file = request.files["template_file"]
-            if template_file and template_file.filename and template_file.filename.lower().endswith((".pptx", ".potx")):
+            tf = request.files["template_file"]
+            if tf and tf.filename and tf.filename.lower().endswith((".pptx", ".potx")):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as tmp:
-                    template_file.save(tmp.name)
+                    tf.save(tmp.name)
                     template_path = tmp.name
 
         try:
@@ -1049,12 +1079,10 @@ def generate_presentation():
             if not slides_data:
                 return jsonify({"error": "Could not generate slides from content"}), 400
 
-            presentation = ppt_generator.create_presentation(slides_data, template_path)
+            prs = ppt_generator.create_presentation(slides_data, template_path)
 
-            # In-memory output to avoid 200/0 length edge cases
             bio = BytesIO()
-            presentation.save(bio)
-            bio.seek(0)
+            prs.save(bio); bio.seek(0)
             return send_file(
                 bio,
                 as_attachment=True,
@@ -1068,10 +1096,8 @@ def generate_presentation():
             return jsonify({"error": "Presentation generation failed. Please try again."}), 500
         finally:
             if template_path and os.path.exists(template_path):
-                try:
-                    os.unlink(template_path)
-                except Exception:
-                    pass
+                try: os.unlink(template_path)
+                except: pass
     except Exception as e:
         logger.error(f"Request error: {e}")
         return jsonify({"error": "Server error"}), 500
@@ -1082,9 +1108,6 @@ def health():
     return jsonify({"status": "healthy", "timestamp": datetime.utcnow().isoformat()})
 
 
-# ------------------------------------------------------------------------------
-# Entrypoint
-# ------------------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
