@@ -18,7 +18,7 @@ import tempfile
 import logging
 from io import BytesIO
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 
 from flask import Flask, request, jsonify, send_file, render_template
 from flask_cors import CORS
@@ -133,7 +133,8 @@ class PPTGenerator:
                 "images": []
             }
 
-        # Pagination step: split overly long content across continuation slides
+        # Pagination + long-bullet splitting before rendering
+        slides_data = self._split_long_bullets(slides_data)
         slides_data = self._paginate_content(slides_data)
 
         # keep style context for helpers
@@ -145,7 +146,7 @@ class PPTGenerator:
                 if self._style_ctx["images"]:
                     img_path = self._style_ctx["images"][i % len(self._style_ctx["images"])]
                     try:
-                        self._place_logo_safe(prs.slides[-1], img_path, slide_data.get("slide_type") == "title_slide")
+                        self._place_logo_safe(prs, prs.slides[-1], img_path, slide_data.get("slide_type") == "title_slide")
                     except Exception:
                         pass
             except Exception as e:
@@ -275,7 +276,7 @@ CONTENT:
         """
         Gemini 2.5 Pro with JSON mode.
         - Version-agnostic: If genai.types.Schema exists, use it; else fallback to MIME-only JSON mode.
-        - Always aggregate from candidates[].content.parts[] (never rely solely on response.text).
+        - Always aggregate from candidates[].content.parts[] (never rely on response.text quick accessor).
         - max_output_tokens set to 4000.
         """
         try:
@@ -312,7 +313,7 @@ CONTENT:
 
             gen_cfg = {
                 "temperature": 0.15,
-                "max_output_tokens": 4000,   # <= as requested
+                "max_output_tokens": 4000,   # as requested
                 "candidate_count": 1,
                 "response_mime_type": "application/json",
             }
@@ -324,19 +325,13 @@ CONTENT:
             # Aggregate JSON from parts
             texts = []
             for cand in getattr(resp, "candidates", []) or []:
-                # Optional: handle blocked/other finish reasons
-                fr = getattr(cand, "finish_reason", None)
-                if getattr(fr, "name", None) in {"SAFETY", "OTHER"}:
-                    raise ValueError("Google error: response blocked; simplify content or reduce length.")
                 content = getattr(cand, "content", None)
                 for part in (getattr(content, "parts", None) or []):
                     t = getattr(part, "text", None)
                     if t:
                         texts.append(t)
 
-            if not texts and getattr(resp, "text", None):
-                texts.append(resp.text)
-
+            # Do NOT call resp.text quick accessor (can raise when parts empty)
             out = ("\n".join(texts)).strip()
             if not out:
                 raise ValueError("Empty response from Google")
@@ -349,8 +344,8 @@ CONTENT:
             if "500" in msg:
                 raise ValueError("Google error: transient server issue (500). Please retry.")
             if "has no attribute 'Schema'" in msg:
-                # Hide SDK mismatch behind a clean message (we already fell back to MIME mode)
-                raise ValueError("Google error: This SDK lacks JSON schema helpers; JSON mode fallback used. Try again.")
+                # We already fell back to MIME mode; surface a cleaner hint
+                raise ValueError("Google error: SDK lacks JSON schema helpers; JSON mode fallback used.")
             raise ValueError(f"Google error: {msg}")
 
     # ------------------------------ Parsing & Validation ------------------------------
@@ -618,6 +613,34 @@ Return ONLY the JSON object.
 
     # ------------------------------ Layout Controls (keep text inside slide) ------------------------------
 
+    def _split_long_bullets(self, slides: List[Dict], max_len: int = 140) -> List[Dict]:
+        """Split very long bullets into two at natural breakpoints to avoid overflow."""
+        out = []
+        for s in slides:
+            bullets = []
+            for b in (s.get("content") or []):
+                t = (b or "").strip()
+                if len(t) <= max_len:
+                    bullets.append(t)
+                else:
+                    # split at punctuation/comma/semicolon/ dash
+                    split_pt = max(
+                        t.rfind(". ", 0, max_len),
+                        t.rfind("; ", 0, max_len),
+                        t.rfind(", ", 0, max_len),
+                        t.rfind(" - ", 0, max_len),
+                    )
+                    if split_pt < 60:  # if no good breakpoint, hard split
+                        split_pt = max_len
+                    bullets.append(t[:split_pt].strip())
+                    rest = t[split_pt:].lstrip(".;,- ").strip()
+                    if rest:
+                        bullets.append(rest[:max_len].strip())
+            s2 = dict(s)
+            s2["content"] = bullets[:5] if bullets else s.get("content", [])
+            out.append(s2)
+        return out
+
     def _paginate_content(self, slides: List[Dict]) -> List[Dict]:
         """
         Split slides whose total character load is too high into continuation slides.
@@ -661,9 +684,9 @@ Return ONLY the JSON object.
                 })
         return paginated
 
-    def _safe_rect(self, slide):
-        """Return a safe content rectangle (left, top, width, height) with margins."""
-        sw, sh = slide.part.slide_width, slide.part.slide_height  # EMU
+    def _safe_rect(self, prs: Presentation) -> Tuple[Emu, Emu, Emu, Emu]:
+        """Return a safe content rectangle (left, top, width, height) with margins, using prs dims."""
+        sw, sh = prs.slide_width, prs.slide_height  # EMU
         margin_x = Emu(Inches(0.8))
         top = Emu(Inches(1.6))
         bottom = Emu(Inches(0.8))
@@ -693,7 +716,6 @@ Return ONLY the JSON object.
 
         # Adaptive font size baseline
         size = base_pt
-        # If a lot of text, go smaller
         joined = " ".join(p.text for p in tf.paragraphs if getattr(p, "text", ""))
         length = len(joined)
         if length > 500:
@@ -726,9 +748,9 @@ Return ONLY the JSON object.
             size = 16
         return size
 
-    def _place_logo_safe(self, slide, img_path: str, is_title: bool):
+    def _place_logo_safe(self, prs: Presentation, slide, img_path: str, is_title: bool):
         """Place a small logo inside bounds at top-right (title) / bottom-right (others)."""
-        sw, sh = slide.part.slide_width, slide.part.slide_height
+        sw, sh = prs.slide_width, prs.slide_height
         desired_h_in = 0.9 if is_title else 1.0
         pic = slide.shapes.add_picture(img_path, Emu(0), Emu(0), height=Emu(Inches(desired_h_in)))
         # place with margin
@@ -818,7 +840,7 @@ Return ONLY the JSON object.
                 self._style_title(slide.shapes.title, index == 0)
             else:
                 # Safe title box near top, within margins
-                sw, sh = slide.part.slide_width, slide.part.slide_height
+                sw = prs.slide_width
                 left = Emu(Inches(0.8))
                 top = Emu(Inches(0.5))
                 width = sw - left - Emu(Inches(0.8))
@@ -879,8 +901,8 @@ Return ONLY the JSON object.
                         except Exception:
                             pass
                 else:
-                    # Safe textbox within margins
-                    left, top, width, height = self._safe_rect(slide)
+                    # Safe textbox within margins (use presentation dims)
+                    left, top, width, height = self._safe_rect(prs)
                     tb = slide.shapes.add_textbox(left, top, width, height)
                     tf = tb.text_frame
                     tf.clear()
@@ -901,7 +923,7 @@ Return ONLY the JSON object.
                             pass
         except Exception as e:
             logger.warning(f"Could not add content: {e}")
-            self._add_basic_content(slide, slide_data.get("content", []))
+            self._add_basic_content(prs, slide, slide_data.get("content", []))
 
         # Speaker notes
         self._add_speaker_notes(slide, slide_data.get("speaker_notes", ""))
@@ -923,9 +945,9 @@ Return ONLY the JSON object.
         except Exception as e:
             logger.debug(f"Title styling failed: {e}")
 
-    def _add_basic_content(self, slide, content_list: List[str]):
+    def _add_basic_content(self, prs: Presentation, slide, content_list: List[str]):
         try:
-            left, top, width, height = self._safe_rect(slide)
+            left, top, width, height = self._safe_rect(prs)
             textbox = slide.shapes.add_textbox(left, top, width, height)
             tf = textbox.text_frame
             tf.clear()
@@ -959,8 +981,8 @@ Return ONLY the JSON object.
         try:
             slide_layout = prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[0]
             slide = prs.slides.add_slide(slide_layout)
-            # Title
-            sw = slide.part.slide_width
+            # Title (use prs dims)
+            sw = prs.slide_width
             left = Emu(Inches(0.8))
             top = Emu(Inches(0.5))
             width = sw - left - Emu(Inches(0.8))
@@ -970,7 +992,7 @@ Return ONLY the JSON object.
             tf.paragraphs[0].font.size = Pt(32)
             tf.paragraphs[0].font.bold = True
             # Content
-            self._add_basic_content(slide, slide_data.get("content") or [])
+            self._add_basic_content(prs, slide, slide_data.get("content") or [])
         except Exception as e:
             logger.error(f"Even fallback slide creation failed: {e}")
 
