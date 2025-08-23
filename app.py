@@ -140,7 +140,7 @@ Generate the JSON now:"""
             openai.api_key = api_key
             
             response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo-1106",  # More recent model
+                model="gpt-5",  # More recent model
                 messages=[
                     {
                         "role": "system", 
@@ -170,7 +170,7 @@ Generate the JSON now:"""
             client = anthropic.Anthropic(api_key=api_key)
             
             response = client.messages.create(
-                model="claude-3-haiku-20240307",
+                model="claude-opus-4-1",
                 max_tokens=1500,
                 temperature=0.3,
                 system="Return only valid JSON. No explanations or formatting.",
@@ -190,7 +190,7 @@ Generate the JSON now:"""
         """Enhanced Google call"""
         try:
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel('gemini-pro')
+            model = genai.GenerativeModel('gemini-2.5-pro')
             
             response = model.generate_content(
                 prompt,
