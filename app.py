@@ -4,7 +4,7 @@ Auto PPT Generator — Single-provider only (no env fallbacks), rate-limit aware
 and robust parsing/rendering to keep text inside slides and maximize output.
 
 - Uses ONLY the provider + API key from the form (no env-key fallbacks)
-- Gemini 2.5 Pro JSON mode, max_output_tokens=4000; no response.text
+- Gemini 2.5 Flash JSON mode, max_output_tokens=4000; no response.text
 - Sectional generation + local MaxiSynth to maximize slide count/details
 - Safe margins, autosize, adaptive font, pagination to avoid text overflow
 """
@@ -53,7 +53,7 @@ class RateLimiter:
     """
     Per-provider best-effort limiter to avoid burst 429s.
     Defaults (can override via env):
-      - google: RPM=5  (Gemini 2.5 Pro free tier)
+      - google: RPM=10  (Gemini 2.5 Flash target)
       - openai: RPM=30
       - anthropic: RPM=10
     """
@@ -61,7 +61,7 @@ class RateLimiter:
     def __init__(self):
         self.last_call_at: Dict[str, float] = {}
         self.rpm = {
-            "google": int(os.environ.get("GEMINI_RPM", "5")),   # was 2
+            "google": int(os.environ.get("GEMINI_RPM", "10")),  # CHANGED to 10
             "openai": int(os.environ.get("OPENAI_RPM", "30")),
             "anthropic": int(os.environ.get("ANTHROPIC_RPM", "10")),
         }
@@ -95,7 +95,7 @@ rl = RateLimiter()
 class PPTGenerator:
     def __init__(self):
         self.supported_providers = ["openai", "anthropic", "google"]
-        self.max_slides = 12
+        self.max_slides = 25   # CHANGED: allow up to 25 slides
         self.min_slides = 3
         self._style_ctx: Optional[dict] = None
         self.section_call_cap = 5  # global cap for sectionals
@@ -511,14 +511,14 @@ JSON FORMAT:
 
     def _call_gemini(self, prompt: str, api_key: str) -> str:
         """
-        Gemini 2.5 Pro, JSON mime mode; avoid response.text; collect parts.
+        Gemini 2.5 Flash, JSON mime mode; avoid response.text; collect parts.
         """
         try:
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel("gemini-2.5-pro")
+            model = genai.GenerativeModel("gemini-2.5-flash")  # CHANGED model
             gen_cfg = {
                 "temperature": 0.1,
-                "max_output_tokens": 4000,   # per your request
+                "max_output_tokens": 4000,   # keep per your request
                 "candidate_count": 1,
                 "response_mime_type": "application/json",
                 "top_p": 0.8,
@@ -552,7 +552,7 @@ JSON FORMAT:
         # Auto-size sectional calls to fit provider RPM in a single minute:
         # calls ≈ 1 primary + N sectionals + 1 refine  →  N ≤ RPM - 2
         if provider == "google":
-            rpm = rl.rpm.get("google", 5)
+            rpm = rl.rpm.get("google", 10)
             dynamic_cap = max(1, min(self.section_call_cap, max(0, rpm - 2)))
             cap = dynamic_cap
         else:
