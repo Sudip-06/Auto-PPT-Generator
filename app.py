@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Auto PPT Generator - Robust LLM parsing (Gemini JSON mode, no Schema hard-dep),
-enhanced prompting, markdown-aware fallback, style & image reuse from uploaded deck,
+enhanced prompting, markdown-aware fallback, template-preserving append,
+style & image reuse from uploaded deck, adaptive layout to keep text inside slide,
 and in-memory download. Keeps index.html unchanged.
 
 Behavior with uploads:
-- If user uploads a .pptx/.potx, we PRESERVE existing slides from that file
-  and APPEND the newly generated slides to the end (as requested).
+- If user uploads a .pptx/.potx, we PRESERVE its existing slides
+  and APPEND LLM-generated slides to the end.
 - We extract fonts/colors and pictures from the uploaded file and apply/reuse them.
 """
 
@@ -29,9 +30,10 @@ import google.generativeai as genai
 
 # --- PowerPoint ---
 from pptx import Presentation
-from pptx.util import Inches, Pt
+from pptx.util import Inches, Pt, Emu
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.enum.text import MSO_AUTO_SIZE
 
 # ------------------------------------------------------------------------------
 # Logging & App
@@ -72,17 +74,16 @@ class PPTGenerator:
             slides = self._robust_json_extraction(response)
             slides = self._validate_and_enhance_slides(slides)
 
-            # Quality gate: if too light, do one refinement pass with the same provider
-            if self._score_slides(slides) < 3.0 or len(slides) < max(4, estimated_slides - 1):
-                try:
-                    improved = self._refine_with_provider(provider, api_key, response, estimated_slides + 2)
-                    slides2 = self._robust_json_extraction(improved)
-                    slides2 = self._validate_and_enhance_slides(slides2)
-                    if self._score_slides(slides2) >= self._score_slides(slides):
-                        slides = slides2
-                        logger.info(f"Refinement improved slides to {len(slides)}")
-                except Exception:
-                    logger.warning("Refinement pass failed; keeping initial slides")
+            # Always try one refinement pass for denser, more accurate bullets
+            try:
+                improved = self._refine_with_provider(provider, api_key, response, estimated_slides + 2)
+                slides2 = self._robust_json_extraction(improved)
+                slides2 = self._validate_and_enhance_slides(slides2)
+                if self._score_slides(slides2) >= self._score_slides(slides):
+                    slides = slides2
+                    logger.info(f"Refinement improved slides to {len(slides)}")
+            except Exception:
+                logger.warning("Refinement pass failed; keeping initial slides")
 
             # ensure a conclusion slide exists at the end
             if not slides or slides[-1].get("slide_type") != "conclusion_slide":
@@ -132,26 +133,24 @@ class PPTGenerator:
                 "images": []
             }
 
+        # Pagination step: split overly long content across continuation slides
+        slides_data = self._paginate_content(slides_data)
+
         # keep style context for helpers
         self._style_ctx = style
         for i, slide_data in enumerate(slides_data):
             try:
                 self._create_enhanced_slide(prs, slide_data, i)
-                # opportunistic image reuse from template assets
+                # opportunistic image reuse from template assets (position safely)
                 if self._style_ctx["images"]:
                     img_path = self._style_ctx["images"][i % len(self._style_ctx["images"])]
                     try:
-                        slide = prs.slides[-1]
-                        if slide_data.get("slide_type") == "title_slide":
-                            slide.shapes.add_picture(img_path, Inches(9.0), Inches(0.3), height=Inches(0.8))
-                        else:
-                            slide.shapes.add_picture(img_path, Inches(9.2), Inches(5.2), height=Inches(1.0))
+                        self._place_logo_safe(prs.slides[-1], img_path, slide_data.get("slide_type") == "title_slide")
                     except Exception:
                         pass
             except Exception as e:
                 logger.error(f"Error creating slide {i}: {e}")
                 self._create_fallback_slide(prs, slide_data, i)
-        # cleanup: not deleting image temp files here to avoid races on concurrent requests
         self._style_ctx = None
         return prs
 
@@ -277,7 +276,7 @@ CONTENT:
         Gemini 2.5 Pro with JSON mode.
         - Version-agnostic: If genai.types.Schema exists, use it; else fallback to MIME-only JSON mode.
         - Always aggregate from candidates[].content.parts[] (never rely solely on response.text).
-        - max_output_tokens set to 4000 as requested.
+        - max_output_tokens set to 4000.
         """
         try:
             genai.configure(api_key=api_key)
@@ -313,7 +312,7 @@ CONTENT:
 
             gen_cfg = {
                 "temperature": 0.15,
-                "max_output_tokens": 4000,   # <= per your request
+                "max_output_tokens": 4000,   # <= as requested
                 "candidate_count": 1,
                 "response_mime_type": "application/json",
             }
@@ -617,6 +616,126 @@ Return ONLY the JSON object.
         )
         return slides
 
+    # ------------------------------ Layout Controls (keep text inside slide) ------------------------------
+
+    def _paginate_content(self, slides: List[Dict]) -> List[Dict]:
+        """
+        Split slides whose total character load is too high into continuation slides.
+        Heuristic thresholds; avoids overflow on small placeholders in some templates.
+        """
+        paginated: List[Dict] = []
+        per_slide_char_limit = 600  # rough capacity for 18–20pt with bullets
+        for s in slides:
+            bullets = s.get("content") or []
+            total_len = sum(len(b or "") for b in bullets)
+            if total_len <= per_slide_char_limit or s.get("slide_type") == "title_slide":
+                paginated.append(s)
+                continue
+
+            # Split into chunks by cumulative length
+            chunk: List[str] = []
+            chunk_len = 0
+            chunk_idx = 1
+            for b in bullets:
+                blen = len(b or "")
+                if chunk and (chunk_len + blen) > per_slide_char_limit:
+                    paginated.append({
+                        "title": f"{s.get('title','Slide')} (cont. {chunk_idx})",
+                        "content": chunk[:5],
+                        "slide_type": "content_slide",
+                        "speaker_notes": s.get("speaker_notes","")
+                    })
+                    chunk = []
+                    chunk_len = 0
+                    chunk_idx += 1
+                chunk.append(b)
+                chunk_len += blen
+
+            if chunk:
+                suffix = "" if chunk_idx == 1 else f" (cont. {chunk_idx})"
+                paginated.append({
+                    "title": f"{s.get('title','Slide')}{suffix}",
+                    "content": chunk[:5],
+                    "slide_type": "content_slide",
+                    "speaker_notes": s.get("speaker_notes","")
+                })
+        return paginated
+
+    def _safe_rect(self, slide):
+        """Return a safe content rectangle (left, top, width, height) with margins."""
+        sw, sh = slide.part.slide_width, slide.part.slide_height  # EMU
+        margin_x = Emu(Inches(0.8))
+        top = Emu(Inches(1.6))
+        bottom = Emu(Inches(0.8))
+        left = margin_x
+        width = sw - Emu(Inches(0.8)) - margin_x
+        height = sh - top - bottom
+        return left, top, width, height
+
+    def _apply_textframe_presentation_defaults(self, tf, base_pt=20):
+        """Word-wrap, auto-size to fit, margins, and adaptive font size."""
+        try:
+            tf.word_wrap = True
+        except Exception:
+            pass
+        try:
+            tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+        except Exception:
+            pass
+        # margins (EMU)
+        try:
+            tf.margin_left = Emu(Inches(0.1))
+            tf.margin_right = Emu(Inches(0.1))
+            tf.margin_top = Emu(Inches(0.05))
+            tf.margin_bottom = Emu(Inches(0.05))
+        except Exception:
+            pass
+
+        # Adaptive font size baseline
+        size = base_pt
+        # If a lot of text, go smaller
+        joined = " ".join(p.text for p in tf.paragraphs if getattr(p, "text", ""))
+        length = len(joined)
+        if length > 500:
+            size = 16
+        elif length > 350:
+            size = 18
+        else:
+            size = base_pt
+
+        # Apply size + style to first paragraph; others set in add loop
+        try:
+            p0 = tf.paragraphs[0]
+            p0.font.size = Pt(size)
+            ctx = getattr(self, "_style_ctx", None) or {}
+            if ctx.get("body_font"):
+                p0.font.name = ctx["body_font"]
+            p0.font.color.rgb = (ctx.get("body_color", RGBColor(64, 64, 64)))
+        except Exception:
+            pass
+
+        return size
+
+    def _ideal_bullet_font_size(self, bullets: List[str]) -> int:
+        n = len(bullets or [])
+        avg_len = sum(len(b or "") for b in bullets) / max(n, 1)
+        size = 20
+        if n >= 5 or avg_len > 90:
+            size = 18
+        if n >= 6 or avg_len > 120:
+            size = 16
+        return size
+
+    def _place_logo_safe(self, slide, img_path: str, is_title: bool):
+        """Place a small logo inside bounds at top-right (title) / bottom-right (others)."""
+        sw, sh = slide.part.slide_width, slide.part.slide_height
+        desired_h_in = 0.9 if is_title else 1.0
+        pic = slide.shapes.add_picture(img_path, Emu(0), Emu(0), height=Emu(Inches(desired_h_in)))
+        # place with margin
+        margin = Emu(Inches(0.3 if is_title else 0.4))
+        pic.left = sw - margin - pic.width
+        pic.top = (Emu(Inches(0.3)) if is_title else (sh - margin - pic.height))
+
     # ------------------------------ Template Style/Assets ------------------------------
 
     def _extract_style_and_assets(self, prs: Presentation) -> dict:
@@ -693,37 +812,66 @@ Return ONLY the JSON object.
 
         # Title
         try:
+            title_text = slide_data["title"]
             if getattr(slide.shapes, "title", None):
-                slide.shapes.title.text = slide_data["title"]
+                slide.shapes.title.text = title_text
                 self._style_title(slide.shapes.title, index == 0)
             else:
-                tb = slide.shapes.add_textbox(Inches(0.8), Inches(0.4), Inches(8.4), Inches(1.0))
+                # Safe title box near top, within margins
+                sw, sh = slide.part.slide_width, slide.part.slide_height
+                left = Emu(Inches(0.8))
+                top = Emu(Inches(0.5))
+                width = sw - left - Emu(Inches(0.8))
+                height = Emu(Inches(1.2))
+                tb = slide.shapes.add_textbox(left, top, width, height)
                 tf = tb.text_frame
-                tf.text = slide_data["title"]
-                tf.paragraphs[0].font.size = Pt(32 if index == 0 else 28)
-                tf.paragraphs[0].font.bold = True
+                tf.clear()
+                p = tf.paragraphs[0]
+                p.text = title_text
+                p.font.bold = True
+                p.font.size = Pt(36 if index == 0 else 30)
+                ctx = getattr(self, "_style_ctx", None) or {}
+                if ctx.get("title_font"):
+                    p.font.name = ctx["title_font"]
+                try:
+                    p.font.color.rgb = ctx.get("title_color", RGBColor(31, 73, 125))
+                except Exception:
+                    pass
         except Exception as e:
             logger.debug(f"Title add failed: {e}")
 
         # Content
         try:
-            content = slide_data.get("content") or []
-            if content:
+            bullets = slide_data.get("content") or []
+            if bullets:
+                # Try a content placeholder
                 ph = None
                 for ph_i in getattr(slide, "placeholders", []):
                     if hasattr(ph_i, "text_frame") and ph_i != getattr(slide.shapes, "title", None):
                         ph = ph_i
                         break
-                if ph and hasattr(ph, "text_frame"):
+
+                use_ph = False
+                if ph and hasattr(ph, "height") and hasattr(ph, "width"):
+                    # If placeholder visibly large, use it; else create our own box
+                    try:
+                        if ph.height >= Emu(Inches(2.0)) and ph.width >= Emu(Inches(5.0)):
+                            use_ph = True
+                    except Exception:
+                        use_ph = True
+
+                if use_ph:
                     tf = ph.text_frame
                     tf.clear()
-                    for i, bullet_text in enumerate(content):
+                    base_size = self._ideal_bullet_font_size(bullets)
+                    self._apply_textframe_presentation_defaults(tf, base_pt=base_size)
+                    for i, bullet_text in enumerate(bullets):
                         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
                         p.text = bullet_text
                         p.level = 0
                         try:
-                            p.font.size = Pt(20)
-                            p.space_after = Pt(8)
+                            p.font.size = Pt(base_size)
+                            p.space_after = Pt(6)
                             ctx = getattr(self, "_style_ctx", None) or {}
                             if ctx.get("body_font"):
                                 p.font.name = ctx["body_font"]
@@ -731,7 +879,26 @@ Return ONLY the JSON object.
                         except Exception:
                             pass
                 else:
-                    self._add_basic_content(slide, content)
+                    # Safe textbox within margins
+                    left, top, width, height = self._safe_rect(slide)
+                    tb = slide.shapes.add_textbox(left, top, width, height)
+                    tf = tb.text_frame
+                    tf.clear()
+                    base_size = self._ideal_bullet_font_size(bullets)
+                    self._apply_textframe_presentation_defaults(tf, base_pt=base_size)
+                    for i, bullet_text in enumerate(bullets):
+                        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+                        p.text = f"{bullet_text}"
+                        p.level = 0
+                        try:
+                            p.font.size = Pt(base_size)
+                            p.space_after = Pt(6)
+                            ctx = getattr(self, "_style_ctx", None) or {}
+                            if ctx.get("body_font"):
+                                p.font.name = ctx["body_font"]
+                            p.font.color.rgb = ctx.get("body_color", RGBColor(64, 64, 64))
+                        except Exception:
+                            pass
         except Exception as e:
             logger.warning(f"Could not add content: {e}")
             self._add_basic_content(slide, slide_data.get("content", []))
@@ -758,14 +925,17 @@ Return ONLY the JSON object.
 
     def _add_basic_content(self, slide, content_list: List[str]):
         try:
-            left, top, width, height = Inches(1), Inches(2), Inches(8), Inches(4)
+            left, top, width, height = self._safe_rect(slide)
             textbox = slide.shapes.add_textbox(left, top, width, height)
             tf = textbox.text_frame
+            tf.clear()
+            base_size = self._ideal_bullet_font_size(content_list)
+            self._apply_textframe_presentation_defaults(tf, base_pt=base_size)
             for i, bullet_text in enumerate(content_list):
                 p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-                p.text = f"• {bullet_text}"
+                p.text = f"{bullet_text}"
                 try:
-                    p.font.size = Pt(18)
+                    p.font.size = Pt(base_size)
                     ctx = getattr(self, "_style_ctx", None) or {}
                     if ctx.get("body_font"):
                         p.font.name = ctx["body_font"]
@@ -790,27 +960,17 @@ Return ONLY the JSON object.
             slide_layout = prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[0]
             slide = prs.slides.add_slide(slide_layout)
             # Title
-            title_box = slide.shapes.add_textbox(Inches(1), Inches(0.5), Inches(8), Inches(1))
+            sw = slide.part.slide_width
+            left = Emu(Inches(0.8))
+            top = Emu(Inches(0.5))
+            width = sw - left - Emu(Inches(0.8))
+            title_box = slide.shapes.add_textbox(left, top, width, Emu(Inches(1.2)))
             tf = title_box.text_frame
             tf.text = slide_data.get("title", f"Slide {index+1}")
             tf.paragraphs[0].font.size = Pt(32)
             tf.paragraphs[0].font.bold = True
             # Content
-            content = slide_data.get("content") or []
-            if content:
-                content_box = slide.shapes.add_textbox(Inches(1), Inches(2), Inches(8), Inches(4))
-                ctf = content_box.text_frame
-                for i, item in enumerate(content[:5]):
-                    p = ctf.paragraphs[0] if i == 0 else ctf.add_paragraph()
-                    p.text = f"• {item}"
-                    try:
-                        p.font.size = Pt(18)
-                        ctx = getattr(self, "_style_ctx", None) or {}
-                        if ctx.get("body_font"):
-                            p.font.name = ctx["body_font"]
-                        p.font.color.rgb = ctx.get("body_color", RGBColor(64, 64, 64))
-                    except Exception:
-                        pass
+            self._add_basic_content(slide, slide_data.get("content") or [])
         except Exception as e:
             logger.error(f"Even fallback slide creation failed: {e}")
 
