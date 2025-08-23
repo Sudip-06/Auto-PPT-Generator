@@ -61,9 +61,9 @@ class RateLimiter:
     def __init__(self):
         self.last_call_at: Dict[str, float] = {}
         self.rpm = {
-            "google": int(os.environ.get("GEMINI_RPM", "50")),  # CHANGED to 10
-            "openai": int(os.environ.get("OPENAI_RPM", "50")),
-            "anthropic": int(os.environ.get("ANTHROPIC_RPM", "50")),
+            "google": int(os.environ.get("GEMINI_RPM", "20")),  # CHANGED to 10
+            "openai": int(os.environ.get("OPENAI_RPM", "30")),
+            "anthropic": int(os.environ.get("ANTHROPIC_RPM", "20")),
         }
 
     def before_call(self, provider: str, retry_after: Optional[int] = None):
@@ -515,10 +515,10 @@ JSON FORMAT:
         """
         try:
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel("gemini-2.5-flash")  # CHANGED model
+            model = genai.GenerativeModel("gemini-2.5-pro")  # CHANGED model
             gen_cfg = {
                 "temperature": 0.1,
-                "max_output_tokens": 4000,   # keep per your request
+                "max_output_tokens": 5000,   # keep per your request
                 "candidate_count": 1,
                 "response_mime_type": "application/json",
                 "top_p": 0.8,
