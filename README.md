@@ -321,45 +321,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## 🙏 Acknowledgments
-
-- **[python-pptx](https://github.com/scanny/python-pptx)** - PowerPoint file manipulation
-- **[Flask](https://flask.palletsprojects.com/)** - Web framework
-- **[OpenAI](https://openai.com/)** - GPT API
-- **[Anthropic](https://anthropic.com/)** - Claude API  
-- **[Google AI](https://ai.google.dev/)** - Gemini API
-- **[Render](https://render.com/)** - Hosting platform
-
-## 📈 Roadmap
-
-### Version 1.1 (Next Release)
-- [ ] Batch presentation generation
-- [ ] More slide layout options
-- [ ] Enhanced error handling
-- [ ] Performance improvements
-
-### Version 1.2
-- [ ] Google Slides export
-- [ ] Advanced template customization
-- [ ] Collaboration features
-- [ ] Usage analytics
-
-### Version 2.0
-- [ ] Custom AI model fine-tuning
-- [ ] Advanced design templates
-- [ ] Integration with cloud storage
-- [ ] Enterprise features
-
-## 💬 Support
-
-- **GitHub Issues**: [Report bugs or request features](https://github.com/yourusername/auto-ppt-generator/issues)
-- **Documentation**: This README and inline code comments
-- **Community**: Discussions tab on GitHub repository
-
----
 
 **Made with ❤️ by developers, for presenters everywhere**
 
 Transform your ideas into presentations instantly • No signup required • Privacy-first • Open source
 
-[🚀 Try it now](https://your-app.onrender.com) • [⭐ Star on GitHub](https://github.com/yourusername/auto-ppt-generator) • [📝 Report Issues](https://github.com/yourusername/auto-ppt-generator/issues)
+[🚀 Try it now](https://auto-ppt-generator.onrender.com/) • [⭐ Star on GitHub](https://github.com/Sudip-06/auto-ppt-generator) • [📝 Report Issues](https://github.com/Sudip-06/auto-ppt-generator/issues)
