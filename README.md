@@ -16,7 +16,7 @@
 
 ## 🚀 Live Demo
 
-Try it now: [https://your-app.onrender.com](https://your-app.onrender.com)
+Try it now: [https://auto-ppt-generator.onrender.com/](https://auto-ppt-generator.onrender.com/)
 
 ## 📋 What You Need
 
